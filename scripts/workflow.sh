@@ -34,10 +34,10 @@ cd "${PROJECT_ROOT}"
 # ── 环境变量 ────────────────────────────────────────────────────────────────
 export PYENV="${PYENV:-myenv}"
 export DEVICES="${DEVICES:-[0]}"
-TIMEOUT_SECS="${TIMEOUT_SECS:-300}"  # 5min 默认超时; 0=无限制
+export TIMEOUT_SECS="${TIMEOUT_SECS:-300}"  # 5min 默认超时; 0=无限制
 
 # ── Worktree 配置 ──────────────────────────────────────────────────────────
-WORKTREE_ENABLED="${WORKTREE_ENABLED:-true}"
+export WORKTREE_ENABLED="${WORKTREE_ENABLED:-true}"
 WORKTREE_EXTRA_FILES="${WORKTREE_EXTRA_FILES:-.env data/}"
 WORKTREE_REGISTRY="${PROJECT_ROOT}/scripts/worktree_registry.json"
 WORKTREE_PARENT_DIR="$(dirname "${PROJECT_ROOT}")"
@@ -93,6 +93,13 @@ EXTRA_ARGS="${*:-}"
 BASE_CMD="python src/workflow.py"
 COMMON_OPTS="workflow.sweep_task.conda_env=${PYENV} workflow.sweep_task.devices=${DEVICES}"
 
+# TIMEOUT_SECS=0 → disable all Python-level timeouts too (evaluate/ablation/sensitivity)
+if [[ "${TIMEOUT_SECS}" == "0" ]]; then
+    TIMEOUT_OPTS="workflow.ablation_task.timeout_secs=0 workflow.evaluate_task.timeout_secs=0 workflow.sensitivity_task.timeout_secs=0"
+else
+    TIMEOUT_OPTS=""
+fi
+
 build_cmd() {
     local mode="$1"
     local sweep_id="$2"
@@ -101,13 +108,13 @@ build_cmd() {
     case "${mode}" in
         pipeline)
             if [[ -n "${sweep_id}" ]]; then
-                echo "${BASE_CMD} workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${extra}"
+                echo "${BASE_CMD} workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             else
-                echo "${BASE_CMD} ${COMMON_OPTS} ${extra}"
+                echo "${BASE_CMD} ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             fi
             ;;
         sweep)
-            echo "${BASE_CMD} workflow.task_name=sweep ${COMMON_OPTS} ${extra}"
+            echo "${BASE_CMD} workflow.task_name=sweep ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             ;;
         evaluate)
             if [[ -z "${sweep_id}" ]]; then
@@ -115,7 +122,7 @@ build_cmd() {
                 echo "   Usage: bash scripts/workflow.sh evaluate <sweep_id>" >&2
                 exit 1
             fi
-            echo "${BASE_CMD} workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${extra}"
+            echo "${BASE_CMD} workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             ;;
         ablation)
             if [[ -z "${sweep_id}" ]]; then
@@ -123,7 +130,7 @@ build_cmd() {
                 echo "   Usage: bash scripts/workflow.sh ablation <sweep_id>" >&2
                 exit 1
             fi
-            echo "${BASE_CMD} workflow=ablation workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${extra}"
+            echo "${BASE_CMD} workflow=ablation workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             ;;
         sensitivity)
             if [[ -z "${sweep_id}" ]]; then
@@ -131,19 +138,19 @@ build_cmd() {
                 echo "   Usage: bash scripts/workflow.sh sensitivity <sweep_id>" >&2
                 exit 1
             fi
-            echo "${BASE_CMD} workflow=sensitivity workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${extra}"
+            echo "${BASE_CMD} workflow=sensitivity workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             ;;
         dry-run)
-            local cmd="${BASE_CMD} workflow.dry_run=true ${COMMON_OPTS} ${extra}"
+            local cmd="${BASE_CMD} workflow.dry_run=true ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             if [[ -n "${sweep_id}" ]]; then
-                cmd="${BASE_CMD} workflow.dry_run=true workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${extra}"
+                cmd="${BASE_CMD} workflow.dry_run=true workflow.target_sweep_id=${sweep_id} ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             fi
             echo "${cmd}"
             ;;
         notify)
-            local cmd="${BASE_CMD} workflow.notification.enabled=true ${COMMON_OPTS} ${extra}"
+            local cmd="${BASE_CMD} workflow.notification.enabled=true ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             if [[ -n "${sweep_id}" ]]; then
-                cmd="${BASE_CMD} workflow.target_sweep_id=${sweep_id} workflow.notification.enabled=true ${COMMON_OPTS} ${extra}"
+                cmd="${BASE_CMD} workflow.target_sweep_id=${sweep_id} workflow.notification.enabled=true ${COMMON_OPTS} ${TIMEOUT_OPTS} ${extra}"
             fi
             echo "${cmd}"
             ;;
@@ -328,8 +335,11 @@ reexec_in_worktree() {
     echo "   IN_WORKTREE=1 bash scripts/workflow.sh ${MODE} ${SWEEP_ID:-""} ${EXTRA_ARGS}"
     echo ""
 
-    cd "${worktree_path}"
-    IN_WORKTREE=1 bash scripts/workflow.sh ${MODE} ${SWEEP_ID:-""} ${EXTRA_ARGS}
+    # Use subshell so parent's CWD unchanged after return
+    (
+        cd "${worktree_path}"
+        IN_WORKTREE=1 bash scripts/workflow.sh ${MODE} ${SWEEP_ID:-""} ${EXTRA_ARGS}
+    )
     return $?
 }
 

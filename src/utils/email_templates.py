@@ -368,8 +368,73 @@ def send_email_with_mimemultipart(notification_cfg: DictConfig, msg: MIMEMultipa
     if not subject:
         subject = str(msg.get("Subject", "workflow_notification"))
 
-    # 简单 markdown (如果未提供)
+    # 未提供 md_content → 从 HTML body 自动提取文本
     if not md_content:
-        md_content = f"# {subject}\n\n(See HTML email for full content)"
+        md_content = _html_to_markdown(msg)
 
     _send_smtp_with_fallback(notification_cfg, msg, subject, md_content, mode=mode)
+
+
+def _html_to_markdown(msg: MIMEMultipart) -> str:
+    """从 MIMEMultipart HTML body 提取纯文本, 转成可读 markdown.
+
+    - 表格 → pipe-delimited 格式
+    - 标题 → # 前缀
+    - 链接 → [text](url)
+    - 代码 → 反引号
+    - CSS/style/注释全清除
+    - 退化: subject 行
+    """
+    import re
+
+    html = ""
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            payload = part.get_payload(decode=True)
+            if payload:
+                html = payload.decode("utf-8", errors="replace")
+            break
+    if not html:
+        return f"# {msg.get('Subject', 'workflow_notification')}"
+
+    # 清除 style / 注释
+    html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL)
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+
+    # 换行标签
+    html = re.sub(r"<br\s*/?>", "\n", html)
+    html = re.sub(r"</p>", "\n", html)
+    html = re.sub(r"</tr>", "\n", html)
+    html = re.sub(r"</th>", " | ", html)
+    html = re.sub(r"</td>", " | ", html)
+    html = re.sub(r"<th[^>]*>", "", html)
+    html = re.sub(r"<td[^>]*>", "", html)
+
+    # 标题
+    html = re.sub(r"<h1[^>]*>", "\n# ", html)
+    html = re.sub(r"</h1>", "\n", html)
+    html = re.sub(r"<h2[^>]*>", "\n## ", html)
+    html = re.sub(r"</h2>", "\n", html)
+    html = re.sub(r"<h3[^>]*>", "\n### ", html)
+    html = re.sub(r"</h3>", "\n", html)
+    html = re.sub(r"<h4[^>]*>", "\n#### ", html)
+    html = re.sub(r"</h4>", "\n", html)
+
+    # 行内元素
+    html = re.sub(r"<code[^>]*>", " `", html)
+    html = re.sub(r"</code>", "` ", html)
+    html = re.sub(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', r'[\2](\1)', html)
+    html = re.sub(r"</?strong[^>]*>", "**", html)
+    html = re.sub(r"</?b[^>]*>", "**", html)
+    html = re.sub(r"</?em[^>]*>", "*", html)
+
+    # 清除残差标签
+    html = re.sub(r"<[^>]+>", "", html)
+    html = html_mod.unescape(html)
+
+    # 折叠多余空行
+    html = re.sub(r"\n{3,}", "\n\n", html)
+    lines = [line.strip() for line in html.split("\n")]
+    html = "\n".join(lines).strip()
+
+    return html or f"# {msg.get('Subject', 'workflow_notification')}"

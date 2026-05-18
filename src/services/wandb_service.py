@@ -84,7 +84,6 @@ class WandbService:
         """根據 group 名稱獲取所有相關的 runs。
 
         使用專用 API 實例 (非 sweep.runs 緩存) 確保每次查詢結果新鮮。
-        避免每次調用都新建 wandb.Api() — 改用惰性初始化緩存實例。
 
         Args:
             force_refresh: 強制重建 API 實例 (繞過 SDK 連接池緩存)
@@ -98,7 +97,14 @@ class WandbService:
         runs = self._runs_api.runs(
             f"{self.entity}/{self.project}", filters={"group": group_name}
         )
-        return list(runs)
+        result = []
+        for r in runs:
+            try:
+                r.load(force=True)  # refresh summary/metrics from server
+            except Exception as e:
+                log.warning(f"Failed to load run {r.id}: {e}")
+            result.append(r)
+        return result
 
     def delete_runs_in_group(self, group_name: str) -> int:
         """刪除指定 group 中的所有 runs。"""

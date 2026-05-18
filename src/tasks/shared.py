@@ -24,7 +24,12 @@ def _refresh_run(run) -> object:
     try:
         import wandb
         api = wandb.Api()
-        fresh_run = api.run(run.path)
+        # W&B local server: run.path may be list ['entity','project','id']
+        # W&B cloud: run.path is string 'entity/project/id'
+        path = run.path
+        if isinstance(path, list):
+            path = "/".join(str(p) for p in path)
+        fresh_run = api.run(path)
         return fresh_run
     except Exception as e:
         log.warning(f"Failed to refresh run {run.id}: {e}")

@@ -222,7 +222,7 @@ class AblationTask(BaseTask):
                 log.info(f"[DRY-RUN] Skipping result collection for ablation '{comp_name}'")
                 continue
 
-            abl_runs = self.wandb_service.get_runs_by_group(group_name)
+            abl_runs = self.wandb_service.get_runs_by_group(group_name, force_refresh=True)
             abl_metrics = {}
             for metric in test_metrics:
                 scores = safe_get_metric_scores(abl_runs, metric)
@@ -358,13 +358,8 @@ class AblationTask(BaseTask):
         eval_ckpt_map = self.load_eval_checkpoints(sweep_id, report_dir)
         rank_key = f"top-{eval_rank}"
         if eval_ckpt_map:
-            checkpoint_paths = eval_ckpt_map.get(rank_key, eval_ckpt_map.get("top-1", []))
-            for key, paths in eval_ckpt_map.items():
-                if key != "top-1":
-                    for p in paths:
-                        if p not in checkpoint_paths:
-                            checkpoint_paths.append(p)
-            log.info(f"📋 Loaded {len(checkpoint_paths)} eval checkpoints from JSON")
+            checkpoint_paths = list(eval_ckpt_map.get(rank_key, []))
+            log.info(f"📋 Loaded {len(checkpoint_paths)} eval checkpoints from JSON (rank_key={rank_key})")
         else:
             project_log_dir = str(Path(self._full_cfg.paths.log_dir).resolve())
             checkpoint_paths = self.collect_checkpoint_paths(project_log_dir)

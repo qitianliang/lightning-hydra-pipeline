@@ -244,7 +244,7 @@ class BaseTask:
 
         Args:
             session_name: tmux session 名称
-            timeout_secs: 超时秒数 (默认 600 = 10min)
+            timeout_secs: 超时秒数 (默认 600 = 10min). 0 或负数 = 无超时
             interval: 轮询间隔秒数
         """
         if is_dry_run():
@@ -252,6 +252,11 @@ class BaseTask:
             return
 
         if not session_name:
+            return
+
+        # 0 或负数 → 无超时, 退化为 wait_for_session
+        if not timeout_secs or timeout_secs <= 0:
+            self.wait_for_session(session_name, interval)
             return
 
         start = time.time()
