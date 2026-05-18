@@ -1,0 +1,172 @@
+# task_name controls the workflow entry mode:
+#   pipeline (default) = optional sweep → pipeline_tasks in order
+#   sweep              = create sweep + wait, no downstream analysis
+task_name: pipeline
+
+# Set to a past sweep_id to skip hyperparameter search and reuse results.
+#   CLI: python src/workflow.py workflow.target_sweep_id=wxsxa50o
+target_sweep_id: null
+
+# dry_run=true prints commands without executing anything.
+dry_run: false
+
+# W&B project where all sweeps and runs are stored.
+wandb:
+  entity: "qitianliang"
+  project: "mnist"
+  name: "base"
+
+# General paths and session naming
+general:
+  status_dir: "logs/sweeps"
+  latest_status_file: "${.status_dir}/${..wandb.entity}-${..wandb.project}-${..wandb.name}-latest.yaml"
+  tmux_session_name: "mnist_workflow"
+
+# Email notification (SMTP credentials from .env)
+notification:
+  enabled: true
+  smtp:
+    host: ${oc.env:SMTP_HOST}
+    port: 465
+    use_ssl: true
+    username: ${oc.env:SMTP_EMAIL_ADDRESS}
+    password: ${oc.env:SMTP_PASSWORD}
+  recipient_email: ${oc.env:USER_EMAIL_ADDRESS}
+
+# Sweep configuration — defines the hyperparameter search
+sweep_task:
+  conda_env: "${oc.env:PYENV}"
+  config_path: "configs/sweep/mnist_sweep.yaml"
+  devices: [0]
+  agent_max_initial_failures: 5
+  # Grid 搜索组合数上限 (默认 100, 防误操作)
+  max_grid_combinations: 100
+
+# Evaluation configuration — retrain best params with N seeds
+evaluate_task:
+  target_sweep_id:
+  # rerun = delete old eval runs + recreate; resume = use existing
+  mode: "rerun"
+  optimized_metric: "val/acc_best"
+  top_n: 2                     # 取前N最优参数 (默认2, 最大3)
+  eval_rank: 1                 # ablation/sensitivity 使用第N优参数 (1=best, 2=2nd best)
+  wait_for_sweep_finish: true
+  wait_interval_seconds: 15
+  # 超时: 默认 3600s (1h), 超时自动 kill tmux session
+  #       设为 0 禁用超时 (不推荐, 训练挂起会永久阻塞 workflow)
+  timeout_secs: 3600
+  num_seeds: 5                 # Stage 2: 每个参数跑5个种子 (workflow_rules)
+  seed_start: 42
+  run_command:
+    base_args:
+      - "python"
+      - "src/train.py"
+      - "experiment=example"
+      - "trainer=gpu"
+      - "logger.wandb.project=${workflow.wandb.project}"
+  test_metrics:
+    - "test/acc"
+    - "test/loss"
+  report_path: "logs/final_reports/optimized_results_{sweep_id}.json"
+  # Baseline comparison (optional, null = skip)
+  baseline:
+    enabled: false
+    metric: "test/acc"
+    value: 0.95                # baseline value for improvement% calc
+
+# Override (ablation) configuration — best params + forced overrides
+override_task:
+  name: "override_batch_size_256"
+  overrides:
+    data.batch_size: 256
+  mode: "rerun"
+  optimized_metric: "val/acc_best"
+  wait_for_sweep_finish: true
+  wait_interval_seconds: 15
+  num_seeds: 3                 # Stage 3/4: 每个参数跑3个种子 (workflow_rules)
+  seed_start: 42
+  run_command:
+    base_args:
+      - "python"
+      - "src/train.py"
+      - "experiment=example"
+      - "trainer=gpu"
+      - "logger.wandb.project=${workflow.wandb.project}"
+  test_metrics:
+    - "test/acc"
+    - "test/loss"
+  report_path: "logs/final_reports/{group_name}.json"
+
+# Ablation task configuration (used by task_name=ablation or pipeline type=ablation)
+ablation_task:
+  timeout_secs: 600             # 超时: 10min, 超时自动 kill
+  parallel: true                # 并行模式: true=所有消融组并行
+  num_seeds: 3
+  seed_start: 42
+  test_metrics:
+    - "test/acc"
+    - "test/loss"
+  report_path: "logs/final_reports/ablation_{sweep_id}.json"
+  components: []                # 在此或 workflow=ablation 中定义
+
+# Sensitivity task configuration (used by task_name=sensitivity or pipeline type=sensitivity)
+sensitivity_task:
+  timeout_secs: 600             # 超时: 10min, 超时自动 kill
+  num_seeds: 3
+  seed_start: 42
+  test_metrics:
+    - "test/acc"
+    - "test/loss"
+  primary_metric: "test/acc"
+  report_path: "logs/final_reports/sensitivity_{sweep_id}.json"
+  # 新格式: sensitivities 列表 (与 param_grid 互斥, 优先使用)
+  sensitivities: []             # 在此或 workflow=sensitivity 中定义
+  # 向后兼容: 单个 param_grid (sensitivities 为空时使用)
+  param_grid: {}
+  axis_labels:
+    optimizer.lr: "Learning Rate"
+    model.net.lin1_size: "First Layer Size"
+    model.net.lin2_size: "Second Layer Size"
+    data.batch_size: "Batch Size"
+  figure_width: 3.5             # 双列文献单列宽度 (inch)
+  figure_dpi: 300
+
+# Worktree isolation configuration
+worktree:
+  enabled: true
+  extra_files: [".env", "data/"]
+  sweep_name: "base"              # 匹配 configs/sweep/mnist_sweep.yaml 的 name
+  registry_path: "scripts/worktree_registry.json"
+
+# pipeline_tasks: stages run in sequence after sweep (or when target_sweep_id is set)
+# Supported types:
+#   evaluate    — retrain best sweep params with N seeds, aggregate metrics
+#   override    — same as evaluate but inject extra overrides (ablation)
+#   grid        — Cartesian product of multiple params (sensitivity analysis)
+#   ablation    — 消融实验模式 (自动获取 evaluate 结果, 对比汇总)
+#   sensitivity — 参数敏感性模式 (1D/2D 绘图, PDF 附件)
+pipeline_tasks:
+  # Evaluate: retrain best sweep params with default seeds (2), aggregate metrics
+  - name: "Full_Model"
+    type: "evaluate"
+
+  # Ablation: override one hyperparameter to test sensitivity
+  # - name: "ablation_batch_256"
+  #   type: "override"
+  #   overrides:
+  #     data.batch_size: 256
+
+  # Grid: Cartesian product of multiple params for sensitivity analysis
+  # - name: "width_search"
+  #   type: "grid"
+  #   params:
+  #     model.net.lin1_size: [64, 128, 256]
+  #     model.net.lin2_size: [128, 256]
+
+  # Ablation mode (standalone): auto-fetches evaluate results, compares all components
+  # - name: "ablation_study"
+  #   type: "ablation"
+
+  # Sensitivity mode (standalone): 1D/2D grid with paper-style plots + PDF
+  # - name: "sensitivity_lr"
+  #   type: "sensitivity"

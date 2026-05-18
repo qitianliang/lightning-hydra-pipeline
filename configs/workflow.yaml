@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - _self_
+  # 這一行是關鍵：它告訴 Hydra 去 'configs/workflow/' 目錄下
+  # 尋找 'mnist.yaml' 文件，並將其內容加載到一個名為 'workflow' 的鍵下面。
+  - workflow: mnist
+  - paths: default
+  - hydra: workflow_logging
+# 可以在這裡放置一些真正全局的、可能被命令行覆蓋的頂層參數，
+# 但為了清晰，我們將所有相關配置都保留在 workflow 模塊中。

@@ -1,0 +1,54 @@
+# configs/workflow/mnist_full.yaml
+# 正式实验工作流配置 — 无 debug 限制，完整训练
+# Usage:
+#   bash scripts/workflow.sh pipeline                              # debug (默认)
+#   python src/workflow.py workflow=mnist_full                      # full
+#   bash scripts/workflow.sh pipeline "" "workflow=mnist_full"      # full via script
+#   bash scripts/workflow.sh ablation <SWEEP_ID> "workflow=mnist_full"  # full ablation
+#   bash scripts/workflow.sh sensitivity <SWEEP_ID> "workflow=mnist_full"  # full sensitivity
+#
+# 与 workflow/mnist.yaml 的区别:
+#   - sweep_task.config_path → mnist_sweep_full.yaml (run_cap=20, experiment=mnist_full)
+#   - evaluate_task.run_command.base_args → experiment=mnist_full
+#   - override_task.run_command.base_args → experiment=mnist_full
+#   - evaluate_task.num_seeds: 5 (vs 默认5, 但 mnist.yaml 已设5)
+#   - ablation_task.num_seeds: 5
+#   - sensitivity_task.num_seeds: 5
+
+defaults:
+  - mnist  # 继承同组 mnist 基础配置
+
+# ── Sweep: 使用完整配置 ──────────────────────────────────────────────
+sweep_task:
+  config_path: "configs/sweep/mnist_sweep_full.yaml"
+
+# ── Evaluate: 使用完整实验配置 ────────────────────────────────────────
+evaluate_task:
+  run_command:
+    base_args:
+      - "python"
+      - "src/train.py"
+      - "experiment=mnist_full"
+      - "trainer=gpu"
+      - "logger.wandb.project=${workflow.wandb.project}"
+  num_seeds: 5
+  top_n: 2
+
+# ── Override: 使用完整实验配置 ────────────────────────────────────────
+override_task:
+  run_command:
+    base_args:
+      - "python"
+      - "src/train.py"
+      - "experiment=mnist_full"
+      - "trainer=gpu"
+      - "logger.wandb.project=${workflow.wandb.project}"
+  num_seeds: 5
+
+# ── Ablation: 5 seeds ────────────────────────────────────────────────
+ablation_task:
+  num_seeds: 5
+
+# ── Sensitivity: 5 seeds ─────────────────────────────────────────────
+sensitivity_task:
+  num_seeds: 5

@@ -1,0 +1,40 @@
+# @package _global_
+
+# Production experiment config — no debug limits, full training
+# Usage: python src/train.py experiment=mnist_full
+
+defaults:
+  - override /data: mnist
+  - override /model: mnist
+  - override /callbacks: default
+  - override /trainer: default
+  - override /logger: wandb
+  - override /hydra: default
+  - override /builder: dynamic
+
+tags: ["mnist", "simple_dense_net"]
+optimized_metric: val/acc_best
+seed: 42
+
+trainer:
+  min_epochs: 1
+  max_epochs: 10
+  gradient_clip_val: 0.5
+
+model:
+  optimizer:
+    lr: 0.001
+    weight_decay: 0.0
+  net:
+    lin1_size: 64
+    lin2_size: 128
+    lin3_size: 64
+  compile: false
+
+data:
+  batch_size: 64
+
+logger:
+  wandb:
+    save_dir: "${paths.root_dir}"
+    save_code: true

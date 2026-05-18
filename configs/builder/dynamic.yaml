@@ -1,0 +1,6 @@
+_target_: src.builders.dynamic_factory.DynamicConfigModelFactory
+_partial_: true
+
+transfer_attributes:
+  - source: num_classes
+    target: model.net.output_size

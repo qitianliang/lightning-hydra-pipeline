@@ -1,0 +1,11 @@
+defaults:
+  - default
+run:
+  dir: ${paths.log_dir}/workflow/${workflow.task_name}/runs/${now:%Y-%m-%d_%H-%M-%S}
+
+job_logging:
+  handlers:
+    file:
+      # Incorporates fix from https://github.com/facebookresearch/hydra/pull/2242
+      # NOTE: run dir already contains {task_name}/, so just name it run.log
+      filename: ${hydra.runtime.output_dir}/run.log

@@ -1,0 +1,43 @@
+# configs/workflow/ablation.yaml
+# 消融实验专用配置 — 通过 `bash scripts/workflow.sh ablation <sweep_id>` 加载
+# 继承 mnist 基础配置, 添加消融组件
+#
+# Usage:
+#   bash scripts/workflow.sh ablation <sweep_id>                          # debug
+#   bash scripts/workflow.sh ablation <sweep_id> "workflow=mnist_full"    # full
+#   python src/workflow.py workflow=ablation workflow.target_sweep_id=<ID> "workflow=mnist_full"  # full
+#
+# 新特性: 支持多消融组并行执行 + 超时控制
+#   parallel: true  → 所有消融组在一个 tmux session 并行
+#   parallel: false → 逐个串行执行 (兼容旧行为)
+#   devices=[0,0]   → 单卡双进程并行
+
+defaults:
+  - mnist  # 继承同组 mnist 基础配置
+
+# 覆盖 task_name
+task_name: ablation
+target_sweep_id: null
+
+# 消融实验配置
+ablation_task:
+  # 超时控制: 默认 600s (10min), 超时自动 kill
+  timeout_secs: 600
+  # 并行模式: true=所有消融组并行, false=串行
+  parallel: true
+  num_seeds: 3
+  seed_start: 42
+  test_metrics:
+    - "test/acc"
+    - "test/loss"
+  report_path: "logs/final_reports/ablation_{sweep_id}"
+
+  # 消融组件列表 — 每个组件定义 name + overrides
+  # 多个组件默认并行执行 (parallel: true)
+  components:
+    - name: "no_lin1_bn"
+      overrides:
+        model.net.lin1_size: 32
+    - name: "no_lin2_bn"
+      overrides:
+        model.net.lin2_size: 32

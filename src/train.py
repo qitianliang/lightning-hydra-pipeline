@@ -1,3 +1,4 @@
+import multiprocessing as mp
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
@@ -9,30 +10,18 @@ from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-# ------------------------------------------------------------------------------------ #
-# the setup_root above is equivalent to:
-# - adding project root dir to PYTHONPATH
-#       (so you don't need to force user to install project as a package)
-#       (necessary before importing any local modules e.g. `from src import utils`)
-# - setting up PROJECT_ROOT environment variable
-#       (which is used as a base for paths in "configs/paths/default.yaml")
-#       (this way all filepaths are the same no matter where you run the code)
-# - loading environment variables from ".env" in root dir
-#
-# you can remove it if you:
-# 1. either install project as a package or move entry files to project root dir
-# 2. set `root_dir` to "." in "configs/paths/default.yaml"
-#
-# more info: https://github.com/ashleve/rootutils
-# ------------------------------------------------------------------------------------ #
+# rootutils: adds project root to PYTHONPATH, sets PROJECT_ROOT env,
+# loads .env. See https://github.com/ashleve/rootutils
 
 from src.utils import (
     RankedLogger,
+    WandbCleanupHandler,
     extras,
     get_metric_value,
     instantiate_callbacks,
     instantiate_loggers,
     log_hyperparameters,
+    set_process_title,
     task_wrapper,
 )
 
@@ -50,57 +39,73 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :param cfg: A DictConfig configuration composed by Hydra.
     :return: A tuple with metrics and dict with all instantiated objects.
     """
-    # set seed for random number generators in pytorch, numpy and python.random
-    if cfg.get("seed"):
-        L.seed_everything(cfg.seed, workers=True)
+    # set process title
+    set_process_title(cfg)
+    metric_dict = {}
+    object_dict = {}
 
-    log.info(f"Instantiating datamodule <{cfg.data._target_}>")
-    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
+    # 創建清理處理器的實例
+    cleanup_handler = WandbCleanupHandler(cfg)
 
-    log.info(f"Instantiating model <{cfg.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(cfg.model)
+    # 使用 with 語句包裹核心邏輯
+    with cleanup_handler:
+        if cfg.get("seed"):
+            L.seed_everything(cfg.seed, workers=True)
 
-    log.info("Instantiating callbacks...")
-    callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
+        log.info(f"Instantiating builder <{cfg.builder._target_}>")
+        builder_partial = hydra.utils.instantiate(cfg.builder)
 
-    log.info("Instantiating loggers...")
-    logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
+        log.info("Completing builder instantiation by passing the root 'cfg' object.")
+        builder = builder_partial(cfg=cfg)
+        model, datamodule = builder.create()
 
-    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
+        log.info("Instantiating callbacks...")
+        callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
 
-    object_dict = {
-        "cfg": cfg,
-        "datamodule": datamodule,
-        "model": model,
-        "callbacks": callbacks,
-        "logger": logger,
-        "trainer": trainer,
-    }
+        log.info("Instantiating loggers...")
+        logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
 
-    if logger:
-        log.info("Logging hyperparameters!")
-        log_hyperparameters(object_dict)
+        log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
+        trainer: Trainer = hydra.utils.instantiate(cfg.trainer, logger=logger, callbacks=callbacks)
 
-    if cfg.get("train"):
-        log.info("Starting training!")
-        trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+        # Register trainer with cleanup handler
+        cleanup_handler.set_trainer(trainer)
+        object_dict = {
+            "cfg": cfg,
+            "datamodule": datamodule,
+            "model": model,
+            "callbacks": callbacks,
+            "logger": logger,
+            "trainer": trainer,
+        }
 
-    train_metrics = trainer.callback_metrics
+        if logger:
+            log.info("Logging hyperparameters!")
+            log_hyperparameters(object_dict)
 
-    if cfg.get("test"):
-        log.info("Starting testing!")
-        ckpt_path = trainer.checkpoint_callback.best_model_path
-        if ckpt_path == "":
-            log.warning("Best ckpt not found! Using current weights for testing...")
-            ckpt_path = None
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
-        log.info(f"Best ckpt path: {ckpt_path}")
+        if cfg.get("train"):
+            log.info("Starting training!")
+            trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+        train_metrics = trainer.callback_metrics
 
-    test_metrics = trainer.callback_metrics
+        if cfg.get("test"):
+            log.info("Starting testing!")
+            if cfg.ckpt_path:
+                log.info(f"Loading checkpoint: {cfg.ckpt_path}")
+                ckpt_path = cfg.ckpt_path
+            else:
+                log.info("No ckpt_path provided!")
+                ckpt_path = trainer.checkpoint_callback.best_model_path
+                if ckpt_path == "":
+                    log.warning("No best ckpt found!")
+                    ckpt_path = None
+            trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+            log.info(f"Best ckpt path: {ckpt_path}")
 
-    # merge train and test metrics
-    metric_dict = {**train_metrics, **test_metrics}
+        test_metrics = trainer.callback_metrics
+
+        # merge train and test metrics
+        metric_dict = {**train_metrics, **test_metrics}
 
     return metric_dict, object_dict
 
@@ -118,15 +123,16 @@ def main(cfg: DictConfig) -> Optional[float]:
 
     # train the model
     metric_dict, _ = train(cfg)
+    if cfg.train:
+        # safely retrieve metric value for hydra-based hyperparameter optimization
+        metric_value = get_metric_value(
+            metric_dict=metric_dict, metric_name=cfg.get("optimized_metric")
+        )
 
-    # safely retrieve metric value for hydra-based hyperparameter optimization
-    metric_value = get_metric_value(
-        metric_dict=metric_dict, metric_name=cfg.get("optimized_metric")
-    )
-
-    # return optimized metric
-    return metric_value
+        # return optimized metric
+        return metric_value
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()

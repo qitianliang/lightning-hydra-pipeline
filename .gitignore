@@ -152,3 +152,10 @@ configs/local/default.yaml
 
 # Aim logging
 .aim
+
+# workflow
+logs/
+wandb/
+scripts/worktree_registry.json
+scripts/clean/*.sh
+data/

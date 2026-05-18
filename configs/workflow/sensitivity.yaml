@@ -1,0 +1,69 @@
+# configs/workflow/sensitivity.yaml
+# 参数敏感性专用配置 — 通过 `bash scripts/workflow.sh sensitivity <sweep_id>` 加载
+# 继承 mnist 基础配置, 添加敏感性参数网格
+#
+# Usage:
+#   bash scripts/workflow.sh sensitivity <sweep_id>                          # debug
+#   bash scripts/workflow.sh sensitivity <sweep_id> "workflow=mnist_full"    # full
+#   python src/workflow.py workflow=sensitivity workflow.target_sweep_id=<ID> "workflow=mnist_full"  # full
+#
+# 新特性: 支持多个敏感性研究列表 (sensitivities)
+#   每个研究独立定义 name + param_grid + axis_labels
+#   所有研究并行执行, 统一生图+邮件
+#   也向后兼容单个 param_grid 格式
+#   devices=[0,0] → 单卡双进程并行
+
+defaults:
+  - mnist  # 继承同组 mnist 基础配置
+
+# 覆盖 task_name
+task_name: sensitivity
+target_sweep_id: null
+
+# 参数敏感性配置
+sensitivity_task:
+  # 超时控制: 默认 600s (10min), 超时自动 kill
+  timeout_secs: 600
+  num_seeds: 3
+  seed_start: 42
+  test_metrics:
+    - "test/acc"
+    - "test/loss"
+  primary_metric: "test/acc"   # 绘图使用的主指标
+  report_path: "logs/final_reports/sensitivity_{sweep_id}.json"
+
+  # ── 多敏感性研究列表 ──────────────────────────────────────────────
+  # 每个研究定义: name, param_grid, axis_labels
+  # 所有研究并行执行, 每个研究独立绘图
+  sensitivities:
+    - name: "width_sensitivity"
+      param_grid:
+        model.net.lin1_size: [32, 64, 128]
+        model.net.lin2_size: [32, 64, 128]
+      axis_labels:
+        model.net.lin1_size: "First Layer Size"
+        model.net.lin2_size: "Second Layer Size"
+
+    - name: "lr_sensitivity"
+      param_grid:
+        model.optimizer.lr: [0.0001, 0.001, 0.01]
+      axis_labels:
+        model.optimizer.lr: "Learning Rate"
+
+  # ── 向后兼容: 单个 param_grid (与 sensitivities 互斥) ──────────────
+  # 如果 sensitivities 为空/不存在, 则使用 param_grid
+  # param_grid:
+  #   model.net.lin1_size: [32, 64, 128]
+  #   model.net.lin2_size: [32, 64, 128]
+
+  # 通用 axis_labels (向后兼容用)
+  axis_labels:
+    model.optimizer.lr: "Learning Rate"
+    model.net.lin1_size: "First Layer Size"
+    model.net.lin2_size: "Second Layer Size"
+    model.net.lin3_size: "Third Layer Size"
+    data.batch_size: "Batch Size"
+
+  # 绘图参数
+  figure_width: 3.5           # 双列文献单列宽度 (inch)
+  figure_dpi: 300             # PDF 输出 DPI

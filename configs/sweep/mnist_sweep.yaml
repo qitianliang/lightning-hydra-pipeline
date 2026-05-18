@@ -1,0 +1,32 @@
+program: src/train.py
+name: base
+description: MNIST sweep
+project: mnist
+method: bayes
+metric:
+  goal: maximize
+  name: val/acc_best
+parameters:
+  model.optimizer.lr:
+    min: 0.0001
+    max: 0.1
+    distribution: log_uniform_values
+  data.batch_size:
+    values: [32, 64, 128]
+
+early_terminate: # 这个是停止实验的策略相当于构建一个停止实验的策略
+  type: hyperband
+  min_iter: 3
+
+run_cap: 4
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args_no_hyphens}
+  - experiment=example
+  - trainer=gpu
+# replace dataset and city
+# mkdir sweeps/EXAMPLE/
+# wandb sweep sweeps/sweep-EXAMPLE.yaml &> sweeps/EXAMPLE/sweep_example.log

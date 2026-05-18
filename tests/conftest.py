@@ -105,3 +105,65 @@ def cfg_eval(cfg_eval_global: DictConfig, tmp_path: Path) -> DictConfig:
     yield cfg
 
     GlobalHydra.instance().clear()
+
+
+from unittest.mock import MagicMock
+
+# 確保項目根路徑被添加到 sys.path
+# 這對於後續導入 src.services.* 至關重要
+rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+
+
+@pytest.fixture(scope="package")
+def cfg_workflow_global() -> DictConfig:
+    """加載工作流的基礎配置 (`workflow.yaml`)，並為測試設置默認值。 使用 'package' 作用域，所以在整個測試包中只執行一次。"""
+    with initialize(version_base="1.3", config_path="../configs"):
+        cfg = compose(config_name="workflow.yaml", return_hydra_config=True, overrides=[])
+
+        # 為所有測試設置快速、安全的默認值
+        with open_dict(cfg):
+            # 默認開啟 dry_run 模式，防止測試產生副作用
+            cfg.workflow.dry_run = True
+            # 縮短等待時間以加速測試
+            cfg.workflow.evaluate_task.wait_interval_seconds = 1
+            # 減少評估的種子數量
+            cfg.workflow.evaluate_task.num_seeds = 2
+            # top_n = 1 for test speed
+            cfg.workflow.evaluate_task.top_n = 1
+            # 使用一個假的 conda 環境名
+            cfg.workflow.sweep_task.conda_env = "test_env"
+
+    return cfg
+
+
+@pytest.fixture(scope="function")
+def cfg_workflow(cfg_workflow_global: DictConfig, tmp_path: Path) -> DictConfig:
+    """為每個測試函數提供一個獨立的、經過修改的配置副本。 使用 'function' 作用域，確保測試間的文件系統隔離。"""
+    cfg = cfg_workflow_global.copy()
+
+    # 將所有路徑指向由 pytest 提供的臨時目錄
+    with open_dict(cfg):
+        cfg.paths.output_dir = str(tmp_path)
+        cfg.paths.log_dir = str(tmp_path)
+        cfg.workflow.general.status_dir = str(tmp_path / "status")
+        cfg.workflow.evaluate_task.report_path = str(tmp_path / "reports/final_report.json")
+
+    # `yield` 將配置提供給測試函數
+    yield cfg
+
+    # 測試函數結束後，清理 Hydra 的全局狀態
+    GlobalHydra.instance().clear()
+
+
+@pytest.fixture
+def mock_wandb_service(mocker) -> MagicMock:
+    """模擬 (Mock) WandbService，以避免在測試中產生真實的 API 調用。 返回 Mock 對象的實例。"""
+    mock = mocker.patch("src.workflow.WandbService", autospec=True)
+    return mock.return_value
+
+
+@pytest.fixture
+def mock_tmux_service(mocker) -> MagicMock:
+    """模擬 (Mock) TmuxService，以避免在測試中產生真實的 tmux 子進程。 返回 Mock 對象的實例。"""
+    mock = mocker.patch("src.workflow.TmuxService", autospec=True)
+    return mock.return_value

@@ -12,6 +12,7 @@ defaults:
   - paths: default
   - extras: default
   - hydra: default
+  - builder: dynamic
 
   # experiment configs allow for version control of specific hyperparameters
   # e.g. best hyperparameters for given model and datamodule
@@ -28,7 +29,7 @@ defaults:
   - debug: null
 
 # task name, determines output directory path
-task_name: "train"
+task_name: "mnist-demo"
 
 # tags to help you identify your experiments
 # you can overwrite this in experiment configs
