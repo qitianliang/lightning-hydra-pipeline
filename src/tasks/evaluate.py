@@ -89,6 +89,7 @@ class EvaluateTask(BaseTask):
             log.info(f"--- [Phase 2.3] Executing evaluation strategy for top-{rank+1} ---")
             group_name = f"eval/{sweep_id}/top-{rank+1}"
             mode = self.cfg.evaluate_task.mode
+            log.info(f"Evaluation mode: {mode}")
 
             eval_session_name = self.execute_strategy(
                 config_overrides, group_name, mode

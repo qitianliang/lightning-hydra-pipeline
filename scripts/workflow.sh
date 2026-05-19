@@ -32,7 +32,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 # ── 环境变量 ────────────────────────────────────────────────────────────────
-export PYENV="${PYENV:-myenv}"
+export PYENV="${PYENV:-cu129}"
 export TIMEOUT_SECS="${TIMEOUT_SECS:-300}"  # 5min 默认超时; 0=无限制
 
 # ── Worktree 配置 ──────────────────────────────────────────────────────────
