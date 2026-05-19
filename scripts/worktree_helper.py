@@ -33,7 +33,6 @@ def _locked_read_registry(reg_path: Path) -> dict:
 
 def _locked_write_registry(reg_path: Path, data: dict) -> None:
     """Acquire exclusive lock, write registry JSON atomically."""
-    reg_path.parent.mkdir(parents=True, exist_ok=True)
     with open(reg_path, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:

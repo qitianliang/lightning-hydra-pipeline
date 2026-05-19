@@ -11,6 +11,8 @@
 - **配置 key 校验**: 自动检测 `optimizer.lr` → `model.optimizer.lr` 等错误
 - **断点恢复**: pipeline 进度文件自动跳过已完成阶段
 - **Worktree 隔离**: git worktree 自动创建/复用/重建，代码版本冻结
+- **自毁清理脚本**: `scripts/clean/cleanup_*.sh` 执行后自动删除自身，不残留垃圾文件
+- **CUDA_VISIBLE_DEVICES 自动推断**: `.env` 中设置 `CUDA_VISIBLE_DEVICES=0,1,2` 自动转为 `devices=[0,1,2]`
 - **Evaluate 超时保护**: 默认 1h 超时, SIGINT 安全停, 防训练挂起
 - **Grid 上限配置化**: `max_grid_combinations`, 默认 100, 可 CLI 覆盖
 - **W&B 凭据安全**: 凭据 export 在脚本顶部, 不暴露于 `/proc/PID/cmdline`
@@ -26,7 +28,7 @@
 cp .env.example .env  # 填入 WANDB_API_KEY, SMTP_* 等
 
 # 2. Debug 运行 (experiment=example, limit_*=3)
-bash scripts/workflow.sh pipeline                        # 全流程
+bash scripts/workflow.sh pipeline                        # 全流程 (单卡，默认 devices=[0])
 bash scripts/workflow.sh pipeline <SWEEP_ID>             # 复用 sweep
 bash scripts/workflow.sh ablation <SWEEP_ID>             # 消融实验
 bash scripts/workflow.sh sensitivity <SWEEP_ID>          # 参数敏感性

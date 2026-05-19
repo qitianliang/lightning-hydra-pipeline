@@ -73,6 +73,14 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
     set +a
 fi
 
+# 若未显式设置 DEVICES，从 CUDA_VISIBLE_DEVICES 自动推断
+#   CUDA_VISIBLE_DEVICES=0      → DEVICES=[0]
+#   CUDA_VISIBLE_DEVICES=0,1,2  → DEVICES=[0,1,2]
+if [[ -z "${DEVICES:-}" ]] && [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    DEVICES="[$(echo "${CUDA_VISIBLE_DEVICES}" | tr -d ' ')]"
+fi
+export DEVICES="${DEVICES:-[0]}"
+
 # ── wandb 登录检查 ──────────────────────────────────────────────────────────
 if [[ -n "${WANDB_API_KEY:-}" ]] && [[ -n "${WANDB_BASE_URL:-}" ]]; then
     wandb login "${WANDB_API_KEY}" 2>/dev/null || true
@@ -91,7 +99,7 @@ EXTRA_ARGS="${*:-}"
 
 # 公共参数
 BASE_CMD="python src/workflow.py"
-COMMON_OPTS="workflow.sweep_task.conda_env=${PYENV} workflow.sweep_task.devices=${DEVICES}"
+COMMON_OPTS="workflow.sweep_task.conda_env=${PYENV} workflow.devices=${DEVICES}"
 
 # TIMEOUT_SECS=0 → disable all Python-level timeouts too (evaluate/ablation/sensitivity)
 if [[ "${TIMEOUT_SECS}" == "0" ]]; then
@@ -223,15 +231,20 @@ snapshot_dirty_workspace() {
 copy_extra_files() {
     local worktree_path="$1"
     local file
-    for file in ${WORKTREE_EXTRA_FILES}; do
+    for file in $(echo ${WORKTREE_EXTRA_FILES}); do
         local src="${PROJECT_ROOT}/${file}"
         local dst="${worktree_path}/${file}"
         if [[ -e "${src}" ]]; then
             if [[ -d "${src}" ]]; then
                 # 目录: rsync 保持结构
                 mkdir -p "${dst}"
-                rsync -a --exclude='.git' "${src}/" "${dst}/" 2>/dev/null || \
-                    cp -r "${src}" "${dst}" 2>/dev/null || true
+                rsync -av --exclude='.git' "${src}/" "${dst}/" || {
+                    echo "  ❌ rsync failed for ${file}, trying cp -r..."
+                    cp -r "${src}" "${dst}" || {
+                        echo "  ❌ cp -r also failed for ${file}!"
+                        exit 1
+                    }
+                }
                 echo "  📁 Copied directory: ${file}"
             else
                 # 文件: 直接复制
@@ -255,17 +268,15 @@ generate_cleanup_script() {
     clean_name="cleanup_worktree_${registry_key}.sh"
     local clean_path="${clean_dir}/${clean_name}"
 
-    mkdir -p "${clean_dir}"
-
     cat > "${clean_path}" <<CLEANUP_EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
 # ============================================================================
-# 清理脚本: ${registry_key}
-# 自动生成 — 请检查后手动执行
+# 自动生成 — 执行后自动销毁自身
 # ============================================================================
 
+CLEANUP_SCRIPT="${clean_path}"
 MAIN_REPO="${PROJECT_ROOT}"
 WORKTREE_PATH="${worktree_path}"
 BRANCH_NAME="${branch_name}"
@@ -276,10 +287,6 @@ if [[ "\${1:-}" == "--dry-run" ]]; then
     DRY_RUN=true
     echo "🔍 DRY-RUN MODE — 仅预览，不执行删除"
 fi
-
-# 可选确认 (取消注释启用)
-# read -p "确认删除 worktree \${WORKTREE_PATH}? [y/N] " confirm
-# [[ "\${confirm}" != "y" ]] && echo "已取消" && exit 0
 
 echo "╔══════════════════════════════════════════════════╗"
 echo "║  实验清理脚本                                      ║"
@@ -321,6 +328,11 @@ fi
 
 echo ""
 echo "🎉 清理完成!"
+# Step 4: 自毁 — 清理脚本自身
+if ! \${DRY_RUN}; then
+    rm -f "\${CLEANUP_SCRIPT}"
+    echo "🗑️  清理脚本已自毁"
+fi
 CLEANUP_EOF
 
     chmod +x "${clean_path}"
