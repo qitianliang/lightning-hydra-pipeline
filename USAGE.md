@@ -364,13 +364,13 @@ TIMEOUT_SECS=600 bash scripts/workflow.sh sensitivity <sweep_id>
 **Worktree 流程**:
 1. 新 sweep → snapshot 脏区 → `exp/<mode>_<timestamp>` 分支 → worktree
 2. eval/ablation/sensitivity → 查注册表 → 复用已有 worktree 或按 commit 重建
-3. 清理 → `scripts/clean/` 下自动生成清理脚本，手动执行
+3. 清理 → `scripts/clean/` 下自动生成**自毁**清理脚本，执行后自动删除自身
 
 ```bash
-# 预览清理操作
+# 预览清理操作（脚本不自毁，可检查后再执行）
 bash scripts/clean/cleanup_worktree_xxx.sh --dry-run
 
-# 实际清理
+# 实际清理（执行后脚本自动销毁）
 bash scripts/clean/cleanup_worktree_xxx.sh
 ```
 
@@ -420,8 +420,11 @@ bash scripts/workflow.sh sensitivity abc123xyz
 # Enable email notification
 bash scripts/workflow.sh notify abc123xyz
 
-# Custom GPU devices (default [0])
-DEVICES="[0,1]" bash scripts/workflow.sh pipeline
+# Custom GPU devices (默认从 CUDA_VISIBLE_DEVICES 自动推断)
+DEVICES="[0,1]" bash scripts/workflow.sh pipeline   # 显式指定
+# 或仅在 .env 中设置:
+#   CUDA_VISIBLE_DEVICES=0,1,2
+# 脚本自动推断为 devices=[0,1,2]
 
 # Custom conda environment (default myenv)
 PYENV=myenv bash scripts/workflow.sh pipeline
@@ -466,13 +469,13 @@ For **sensitivity mode**, additionally:
 
 ```bash
 # pipeline (default)
-python src/workflow.py workflow.sweep_task.conda_env=myenv workflow.sweep_task.devices=[0]
+python src/workflow.py workflow.sweep_task.conda_env=myenv
 
 # pipeline with existing sweep
-python src/workflow.py workflow.target_sweep_id=abc123xyz workflow.sweep_task.conda_env=myenv workflow.sweep_task.devices=[0]
+python src/workflow.py workflow.target_sweep_id=abc123xyz workflow.sweep_task.conda_env=myenv
 
 # sweep
-python src/workflow.py workflow.task_name=sweep workflow.sweep_task.conda_env=myenv workflow.sweep_task.devices=[0]
+python src/workflow.py workflow.task_name=sweep workflow.sweep_task.conda_env=myenv
 
 # ablation — 使用 workflow=ablation 加载消融专用配置
 python src/workflow.py workflow=ablation workflow.target_sweep_id=abc123xyz
@@ -484,7 +487,7 @@ python src/workflow.py workflow=sensitivity workflow.target_sweep_id=abc123xyz
 python src/workflow.py workflow.target_sweep_id=abc123xyz workflow.evaluate_task.mode=resume
 
 # dry-run
-python src/workflow.py workflow.dry_run=true workflow.sweep_task.conda_env=myenv workflow.sweep_task.devices=[0]
+python src/workflow.py workflow.dry_run=true workflow.sweep_task.conda_env=myenv
 ```
 
 ## Environment
@@ -494,10 +497,13 @@ Set in `.env`:
 WANDB_API_KEY=local-xxx
 WANDB_BASE_URL=http://your.server:port
 PYENV=myenv       # conda/mamba environment name
+CUDA_VISIBLE_DEVICES=0,1,2   # GPU 设备列表，自动转为 workflow.devices
 SMTP_HOST=smtp.example.com  # (optional, for email notifications)
 SMTP_PASSWORD=xxx           # (optional)
 USER_EMAIL_ADDRESS=user@example.com
 ```
+
+> **💡 CUDA_VISIBLE_DEVICES 说明**: `workflow.sh` 在加载 `.env` 后自动将 `CUDA_VISIBLE_DEVICES=0,1,2` 解析为 `DEVICES=[0,1,2]` 传递给 Python。无需再手动写 `DEVICES="[0,1]"`
 
 ## Troubleshooting
 
