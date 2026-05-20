@@ -153,6 +153,12 @@ def _proxy_socket_guard():
 
     # ── 保存原生 socket (安全隔离区起点) ──────────────────────────────────
     original_socket = socket.socket
+    original_getaddrinfo = socket.getaddrinfo
+
+    def _fake_getaddrinfo(host, port, *args, **kwargs):
+        # 透传域名/地址，不做本地 DNS 解析。
+        # socksocket 会在代理隧道内通过 HTTP CONNECT 发送域名，由代理解析。
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, '', (host, port))]
 
     try:
         # ── 自适应: 有代理 → 隧道模式 ─────────────────────────────────────
@@ -163,6 +169,8 @@ def _proxy_socket_guard():
 
         # 劫持！所有新的 socket.socket() 调用将返回 socksocket 实例
         socket.socket = socks.socksocket
+        # 必须同时劫持 getaddrinfo，否则 smtplib 在 create_connection 时本地 DNS 必挂
+        socket.getaddrinfo = _fake_getaddrinfo
 
         log.info(f"📧 SMTP 自适应模式: 代理隧道 → {proxy_host}:{proxy_port} (DNS 由代理解析)")
         yield
@@ -171,6 +179,7 @@ def _proxy_socket_guard():
         # 无论成功、异常、KeyboardInterrupt，都必须执行此恢复
         # 这是零全局污染的核心保障
         socket.socket = original_socket
+        socket.getaddrinfo = original_getaddrinfo
         socks.set_default_proxy()  # 清除 PySocks 全局代理状态
         log.debug("🔒 socket 已恢复原生，代理劫持解除。")
 

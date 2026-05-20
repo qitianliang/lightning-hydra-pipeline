@@ -132,7 +132,12 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         return {}, {}
 
     # Load resume checkpoint (scoped to sweep_id)
-    completed_stages = load_pipeline_progress(cfg, active_sweep_id)
+    # If target_sweep_id is explicitly provided, force rerun all stages
+    if cfg.workflow.get("target_sweep_id"):
+        log.info("Target sweep_id provided. Forcing rerun of all pipeline stages.")
+        completed_stages = set()
+    else:
+        completed_stages = load_pipeline_progress(cfg, active_sweep_id)
 
     for idx, task_cfg in enumerate(pipeline_tasks):
         task_type = task_cfg.type

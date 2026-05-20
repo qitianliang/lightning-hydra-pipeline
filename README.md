@@ -6,10 +6,10 @@
 
 - **6 阶段工作流**: Sweep → Evaluate → Override → Grid → Ablation → Sensitivity
 - **4 种运行模式**: `pipeline`, `sweep`, `ablation`, `sensitivity`
-- **邮件通知**: 自动汇报实验结果、Run URL、复现脚本、W&B 链接
+- **邮件通知**: 自动汇报实验结果、Run URL、复现脚本、W&B 链接；代理环境自动走 HTTP CONNECT 隧道（含 `getaddrinfo` 劫持），零全局污染
 - **论文风格绘图**: 1D 折线图 + 2D 热力图 (serif, 3.5in, dpi=300 PDF)
 - **配置 key 校验**: 自动检测 `optimizer.lr` → `model.optimizer.lr` 等错误
-- **断点恢复**: pipeline 进度文件自动跳过已完成阶段
+- **断点恢复**: pipeline 进度文件自动跳过已完成阶段；显式传入 `target_sweep_id` 时强制重跑全部阶段
 - **Worktree 隔离**: git worktree 自动创建/复用/重建，代码版本冻结
 - **自毁清理脚本**: `scripts/clean/cleanup_*.sh` 执行后自动删除自身，不残留垃圾文件
 - **CUDA_VISIBLE_DEVICES 自动推断**: `.env` 中设置 `CUDA_VISIBLE_DEVICES=0,1,2` 自动转为 `devices=[0,1,2]`
