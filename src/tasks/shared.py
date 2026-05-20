@@ -271,7 +271,7 @@ class RerunStrategy(EvaluationStrategy):
 
         num_seeds = self.num_seeds if self.num_seeds is not None else self.cfg.evaluate_task.num_seeds
         seed_start = self.seed_start if self.seed_start is not None else self.cfg.evaluate_task.seed_start
-        devices = self.cfg.sweep_task.devices
+        devices = self.cfg.devices
 
         all_commands = [
             self.command_builder.build_training_run_command(

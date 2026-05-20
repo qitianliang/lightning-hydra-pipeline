@@ -175,7 +175,7 @@ class BaseTask:
             log.info("Resume mode: skipping parallel execution.")
             return None
 
-        devices = self.cfg.sweep_task.devices
+        devices = self.cfg.devices
 
         # 展平所有实验的 commands
         all_commands = []

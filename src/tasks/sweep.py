@@ -60,7 +60,7 @@ class SweepTask:
             raise SessionError(f"tmux session '{session_name}' already exists.")
 
         worker_defs = []
-        for device in self.cfg.sweep_task.devices:
+        for device in self.cfg.devices:
             agent_command_script = self.command_builder.build_agent_worker_command(full_sweep_path)
             full_worker_command = f"CUDA_VISIBLE_DEVICES={device} bash -c '{agent_command_script}'"
             worker_defs.append({"device": device, "command": full_worker_command})

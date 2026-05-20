@@ -33,11 +33,13 @@ notification:
     password: ${oc.env:SMTP_PASSWORD}
   recipient_email: ${oc.env:USER_EMAIL_ADDRESS}
 
+# Global devices config (override via CLI: workflow.devices=[0,1,2])
+devices: [0]
+
 # Sweep configuration — defines the hyperparameter search
 sweep_task:
   conda_env: "${oc.env:PYENV}"
   config_path: "configs/sweep/mnist_sweep.yaml"
-  devices: [0]
   agent_max_initial_failures: 5
   # Grid 搜索组合数上限 (默认 100, 防误操作)
   max_grid_combinations: 100
