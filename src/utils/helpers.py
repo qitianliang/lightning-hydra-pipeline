@@ -138,18 +138,18 @@ def _send_smtp_with_fallback(cfg, msg, subject: str, markdown_content: str, mode
 
 
 def _send_smtp(cfg, msg):
-    """内部 SMTP 发送 (不含异常处理)。"""
-    if cfg.smtp.use_ssl:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(cfg.smtp.host, cfg.smtp.port, context=context, timeout=10) as server:
-            server.login(cfg.smtp.username, cfg.smtp.password)
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(cfg.smtp.host, cfg.smtp.port) as server:
-            server.starttls()
-            server.login(cfg.smtp.username, cfg.smtp.password)
-            server.send_message(msg)
-    log.info(f"✅ Email notification sent successfully to {cfg.recipient_email}.")
+    """内部 SMTP 发送 (代理感知，零全局污染)。
+
+    重构说明:
+    原版直接用 smtplib 连接，在 Docker 无 DNS 环境必死。
+    现版委托 email_templates.send_email_proxy_aware 处理:
+    - 通过 PySocks 劫持 socket → HTTP CONNECT 隧道 → DNS 甩锅到代理
+    - SSL 加密在隧道内封装，代理只看到乱码
+    - try/finally 保证 socket 恢复，W&B 等组件不受影响
+    """
+    from src.utils.email_templates import send_email_proxy_aware
+
+    send_email_proxy_aware(cfg, msg)
 
 
 # ── Eval 邮件 (per-rank 分段展示) ─────────────────────────────────────────

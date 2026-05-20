@@ -18,4 +18,5 @@ from src.utils.email_templates import (
     build_ablation_email,
     build_sensitivity_email,
     send_email_with_mimemultipart,
+    send_email_proxy_aware,
 )

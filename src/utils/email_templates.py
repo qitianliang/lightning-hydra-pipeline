@@ -1,7 +1,18 @@
 # src/utils/email_templates.py
-"""邮件模板模块 — 纯函数, 构建消融/敏感性专用邮件。"""
+"""邮件模板模块 — 纯函数, 构建消融/敏感性专用邮件。
+
+重构要点：代理感知 SMTP 发送。
+Docker 容器内无外网 DNS，smtplib 原生 socket 直连必死。
+通过 PySocks 劫持 socket → HTTP CONNECT 隧道 → DNS 甩锅到代理服务器。
+严格 try/finally 保证零全局污染，W&B 等组件的 socket 不受影响。
+"""
 
 import html as html_mod
+import os
+import socket
+import smtplib
+import ssl
+from contextlib import contextmanager
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -48,6 +59,186 @@ code {
     font-size: 11px;
 }
 """
+
+
+# ── 代理感知 SMTP 连接工厂 ─────────────────────────────────────────────────
+# 核心问题：Docker 容器无外网 DNS，smtplib 原生 TCP socket 直连 smtp.xxx.com 必死。
+# 解法：PySocks 劫持 socket → HTTP CONNECT 隧道 → DNS 由代理服务器完成。
+# 红线约束：绝对不能永久替换 socket.socket，W&B 等组件需要原生 socket。
+# 因此用 contextmanager 做临时劫持，try/finally 保证无论成败都恢复原状。
+
+
+def _parse_proxy_from_env() -> Optional[tuple]:
+    """从环境变量解析 HTTP 代理地址，返回 (host, port) 或 None。
+
+    自适应设计：无代理环境变量时返回 None，调用方走直连路径；
+    有代理时返回 (host, port)，走 HTTP CONNECT 隧道路径。
+    优先级: HTTPS_PROXY > HTTP_PROXY > https_proxy > http_proxy
+    仅解析 http:// 或 https:// 前缀的代理 URL (socks5 等交给 PySocks 自己处理)。
+    """
+    proxy_url = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("http_proxy")
+    )
+    if not proxy_url or not proxy_url.strip():
+        return None
+
+    proxy_url = proxy_url.strip()
+    # 去掉 http:// 或 https:// 前缀
+    cleaned = proxy_url
+    if cleaned.startswith("https://"):
+        cleaned = cleaned[len("https://"):]
+    elif cleaned.startswith("http://"):
+        cleaned = cleaned[len("http://"):]
+
+    # 去掉尾部路径
+    cleaned = cleaned.split("/")[0]
+
+    # 解析 host:port
+    if ":" in cleaned:
+        host, port_str = cleaned.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            log.warning(f"⚠️ 代理端口解析失败: {proxy_url}, 忽略代理配置。")
+            return None
+        return (host, port)
+    else:
+        # 只有 host 没有端口，用默认 8080
+        log.warning(f"⚠️ 代理 URL 缺少端口: {proxy_url}, 默认使用 8080。")
+        return (cleaned, 8080)
+
+
+@contextmanager
+def _proxy_socket_guard():
+    """【安全隔离区】自适应代理：有代理时临时劫持 socket，无代理时直接透传。
+
+    自适应逻辑:
+    - 无代理环境变量 → yield 后直接返回，socket 保持原生 (本地开发机等有正常 DNS 的环境)
+    - 有代理环境变量 → 临时劫持 socket.socket → HTTP CONNECT 隧道 → finally 恢复
+
+    设计考量:
+    1. 进入时保存原生 socket.socket → 设置 PySocks 代理 → 替换全局 socket.socket
+    2. 退出时 (无论正常还是异常) 在 finally 中恢复原生 socket.socket
+    3. 这确保了 W&B / requests / 其他网络组件在邮件发送完毕后不受影响
+    4. HTTP CONNECT 隧道使得 DNS 解析发生在代理服务器端，绕过 Docker DNS 黑洞
+
+    用法:
+        with _proxy_socket_guard():
+            # 有代理: smtplib 走代理隧道; 无代理: smtplib 直连
+            ...
+        # 此区间外，socket.socket 已恢复原状，W&B 正常工作
+    """
+    proxy_info = _parse_proxy_from_env()
+    if proxy_info is None:
+        # ── 自适应: 无代理 → 直连模式 ────────────────────────────────────
+        # 本地开发机、有正常 DNS 的服务器等环境，无需任何 socket 劫持
+        log.info("📧 SMTP 自适应模式: 直连 (未检测到代理环境变量)")
+        yield
+        return
+
+    proxy_host, proxy_port = proxy_info
+
+    try:
+        import socks
+    except ImportError:
+        log.warning(
+            "⚠️ 检测到代理环境变量但 PySocks 未安装！"
+            "将回退到直连模式 (Docker 内可能失败)。请运行: pip install PySocks"
+        )
+        yield
+        return
+
+    # ── 保存原生 socket (安全隔离区起点) ──────────────────────────────────
+    original_socket = socket.socket
+
+    try:
+        # ── 自适应: 有代理 → 隧道模式 ─────────────────────────────────────
+        # 配置 PySocks: HTTP 类型代理，使用 HTTP CONNECT 方法建隧道
+        # 关键：socks.HTTP 会让 PySocks 发送 "CONNECT smtp.xxx.com:465 HTTP/1.1"
+        # 代理服务器在远端完成 DNS 解析和 TCP 连接，本地只需连 127.0.0.1:7899
+        socks.set_default_proxy(socks.HTTP, proxy_host, proxy_port)
+
+        # 劫持！所有新的 socket.socket() 调用将返回 socksocket 实例
+        socket.socket = socks.socksocket
+
+        log.info(f"📧 SMTP 自适应模式: 代理隧道 → {proxy_host}:{proxy_port} (DNS 由代理解析)")
+        yield
+    finally:
+        # ── 恢复原生 socket (安全隔离区终点) ──────────────────────────────
+        # 无论成功、异常、KeyboardInterrupt，都必须执行此恢复
+        # 这是零全局污染的核心保障
+        socket.socket = original_socket
+        socks.set_default_proxy()  # 清除 PySocks 全局代理状态
+        log.debug("🔒 socket 已恢复原生，代理劫持解除。")
+
+
+def _create_smtp_connection(cfg) -> smtplib.SMTP:
+    """代理感知 SMTP 连接工厂。
+
+    流程:
+    1. _proxy_socket_guard() 劫持 socket → HTTP CONNECT 隧道
+    2. smtplib 在被劫持的 socket 上连接 SMTP 服务器
+       - DNS 解析由代理服务器完成 (Docker DNS 黑洞被绕过)
+    3. ssl.create_default_context() 包装加密层
+       - 代理服务器只能看到加密乱码，账密安全
+    4. 无论成败，_proxy_socket_guard 的 finally 块恢复原生 socket
+
+    Args:
+        cfg: DictConfig, 需包含 cfg.smtp.host/port/use_ssl/username/password
+
+    Returns:
+        已连接并认证的 smtplib.SMTP 实例
+    """
+    context = ssl.create_default_context()
+
+    if cfg.smtp.use_ssl:
+        # ── SMTP_SSL: 全程加密 (端口 465) ────────────────────────────────
+        # 在代理隧道内建立 SSL 连接，代理服务器只看到加密字节流
+        server = smtplib.SMTP_SSL(
+            cfg.smtp.host, cfg.smtp.port, context=context, timeout=15
+        )
+    else:
+        # ── STARTTLS: 先明文后升级加密 (端口 587/25) ────────────────────
+        # 在代理隧道内先建明文连接，再通过 STARTTLS 升级为加密
+        server = smtplib.SMTP(cfg.smtp.host, cfg.smtp.port, timeout=15)
+        server.ehlo()  # 必须先 ehlo 才能 starttls
+        server.starttls(context=context)
+        server.ehlo()  # 加密后再 ehlo 一次
+
+    server.login(cfg.smtp.username, cfg.smtp.password)
+    return server
+
+
+def send_email_proxy_aware(cfg, msg) -> None:
+    """自适应代理的邮件发送入口 — 无代理直连，有代理走隧道。
+
+    自适应调度逻辑:
+    1. _proxy_socket_guard 检测环境变量:
+       - 无代理 → 直连模式 (socket 保持原生，DNS 在本地解析)
+       - 有代理 → 隧道模式 (临时劫持 socket，DNS 由代理服务器解析)
+    2. _create_smtp_connection 建立加密 SMTP 连接 (SMTP_SSL 或 STARTTLS)
+    3. 发送邮件
+    4. _proxy_socket_guard 的 finally 保证: 有代理时恢复原生 socket (零全局污染)
+
+    无论哪种模式，即使发送过程中抛出任何异常:
+    - 有代理时: socket 一定在 finally 中恢复，不影响 W&B 等组件
+    - 无代理时: 本就未劫持，无恢复需求
+
+    使用场景:
+    - 本地开发机 (有 DNS): 不设代理环境变量 → 自动走直连
+    - Docker 容器 (无 DNS): 设 HTTP_PROXY=http://127.0.0.1:7899 → 自动走隧道
+    无需修改任何代码。
+    """
+    with _proxy_socket_guard():
+        with _create_smtp_connection(cfg) as server:
+            server.send_message(msg)
+
+    proxy_info = _parse_proxy_from_env()
+    mode_label = "代理隧道" if proxy_info else "直连"
+    log.info(f"✅ Email sent successfully ({mode_label}) to {cfg.recipient_email}.")
 
 
 def _build_workflow_html(workflow_info: dict, eval_rank: int = 1) -> str:
