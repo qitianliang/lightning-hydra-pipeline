@@ -98,7 +98,7 @@ EXTRA_ARGS="${*:-}"
 
 # 公共参数
 BASE_CMD="python src/workflow.py"
-COMMON_OPTS="workflow.sweep_task.conda_env=${PYENV} workflow.devices=${DEVICES}"
+COMMON_OPTS="workflow.sweep_task.conda_env=${PYENV} workflow.sweep_task.devices=${DEVICES}"
 
 # TIMEOUT_SECS=0 → disable all Python-level timeouts too (evaluate/ablation/sensitivity)
 if [[ "${TIMEOUT_SECS}" == "0" ]]; then
