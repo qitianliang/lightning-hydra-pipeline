@@ -372,6 +372,141 @@ class TestAblationTaskParallel:
         # Should complete without error in dry-run
         task.run(sweep_id="dry-run-test")
 
+    def test_ablation_dry_run_expands_default_components_without_side_effects(
+        self,
+        cfg_workflow: DictConfig,
+        mock_wandb_service: MagicMock,
+        mock_tmux_service: MagicMock,
+        mocker: MagicMock,
+        tmp_path: Path,
+    ):
+        """Dry-run ablation should exercise component expansion without W&B mutations/tmux."""
+        mocker.patch("src.tasks.shared._DRY_RUN", True)
+
+        report_file = tmp_path / "reports" / "optimized_results_test_sweep.json"
+        report_file.parent.mkdir(parents=True, exist_ok=True)
+        report_file.write_text(json.dumps({
+            "evaluation_summary": {
+                "top-1": {
+                    "metrics": {
+                        "test/acc": {"mean": 0.95, "std": 0.01},
+                        "test/loss": {"mean": 0.15, "std": 0.02},
+                    }
+                }
+            }
+        }))
+
+        with open_dict(cfg_workflow):
+            cfg_workflow.workflow.dry_run = True
+            cfg_workflow.workflow.task_name = "ablation"
+            cfg_workflow.workflow.evaluate_task.report_path = str(report_file)
+            cfg_workflow.workflow.ablation_task.parallel = True
+            cfg_workflow.workflow.ablation_task.num_seeds = 3
+            cfg_workflow.workflow.ablation_task.seed_start = 42
+            cfg_workflow.workflow.ablation_task.report_path = str(tmp_path / "reports" / "ablation_{sweep_id}.json")
+            cfg_workflow.workflow.ablation_task.components = [
+                {"name": "no_lin1_bn", "overrides": {"model.net.lin1_size": 32}},
+                {"name": "no_lin2_bn", "overrides": {"model.net.lin2_size": 32}},
+            ]
+
+        mock_sweep = MagicMock(spec=Sweep, state="FINISHED")
+        type(mock_sweep).id = PropertyMock(return_value="test_sweep")
+        type(mock_sweep).project = PropertyMock(return_value="test-proj")
+        type(mock_sweep).name = PropertyMock(return_value="test-name")
+        mock_sweep.config = {}
+
+        mock_best_run = MagicMock(spec=Run)
+        mock_best_run.config = {"model.optimizer.lr": 0.01, "data.batch_size": 64}
+        type(mock_best_run).id = PropertyMock(return_value="best_run_abc")
+        type(mock_best_run).name = PropertyMock(return_value="best-run-name")
+
+        mock_wandb_service.get_sweep.return_value = mock_sweep
+        mock_wandb_service.find_best_run.return_value = mock_best_run
+
+        def build_command(overrides, seed, group_name, cwd=""):
+            return f"python src/train.py {' '.join(overrides)} seed={seed} logger.wandb.group={group_name}"
+
+        mock_command_builder = MagicMock(spec=CommandBuilder)
+        mock_command_builder.build_training_run_command.side_effect = build_command
+
+        task = AblationTask(
+            cfg_workflow, mock_wandb_service, mock_tmux_service, mock_command_builder
+        )
+        task.run(sweep_id="test_sweep")
+
+        assert mock_command_builder.build_training_run_command.call_count == 6
+        calls = mock_command_builder.build_training_run_command.call_args_list
+        groups = [call.kwargs["group_name"] for call in calls]
+        seeds = [call.kwargs["seed"] for call in calls]
+        override_sets = [call.kwargs["overrides"] for call in calls]
+
+        assert groups.count("ablation/test_sweep/no_lin1_bn") == 3
+        assert groups.count("ablation/test_sweep/no_lin2_bn") == 3
+        assert sorted(set(seeds)) == [42, 43, 44]
+        assert any("model.net.lin1_size=32" in overrides for overrides in override_sets)
+        assert any("model.net.lin2_size=32" in overrides for overrides in override_sets)
+        assert all("model.optimizer.lr=0.01" in overrides for overrides in override_sets)
+        assert all("data.batch_size=64" in overrides for overrides in override_sets)
+
+        mock_wandb_service.delete_runs_in_group.assert_not_called()
+        mock_tmux_service.create_workers_session.assert_not_called()
+        assert not (tmp_path / "reports" / "ablation_test_sweep.json").exists()
+
+    def test_ablation_email_points_to_ablation_report_directory(
+        self,
+        cfg_workflow: DictConfig,
+        mock_wandb_service: MagicMock,
+        mock_tmux_service: MagicMock,
+        mocker: MagicMock,
+        tmp_path: Path,
+    ):
+        """Ablation emails should link to ablation reports, not evaluate reports."""
+        with open_dict(cfg_workflow):
+            cfg_workflow.workflow.evaluate_task.report_path = str(tmp_path / "reports" / "eval_{sweep_id}.json")
+            cfg_workflow.workflow.ablation_task.report_path = str(tmp_path / "reports" / "ablation_{sweep_id}")
+
+        mock_sweep = MagicMock(spec=Sweep)
+        type(mock_sweep).id = PropertyMock(return_value="test_sweep")
+        type(mock_sweep).project = PropertyMock(return_value="test-proj")
+        mock_sweep.config = {"description": "debug sweep"}
+
+        mock_best_run = MagicMock(spec=Run)
+        type(mock_best_run).id = PropertyMock(return_value="best_run_abc")
+        mock_best_run.config = {}
+
+        captured = {}
+
+        def capture_email(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        mocker.patch("src.tasks.ablation.build_ablation_email", side_effect=capture_email)
+        send_mock = mocker.patch("src.tasks.ablation.send_email_with_mimemultipart")
+
+        task = AblationTask(
+            cfg_workflow, mock_wandb_service, mock_tmux_service, MagicMock(spec=CommandBuilder)
+        )
+        task.load_eval_checkpoints = MagicMock(return_value={})
+        task.collect_checkpoint_paths = MagicMock(return_value=[])
+
+        task._send_ablation_email(
+            sweep_id="test_sweep",
+            sweep=mock_sweep,
+            best_run=mock_best_run,
+            best_config_dict={"model.optimizer.lr": "0.01"},
+            full_model_metrics={"test/acc": {"mean": 0.95, "std": 0.01}},
+            ablation_results=[{"name": "no_lin1_bn", "metrics": {"test/acc": {"mean": 0.9, "std": 0.02}}}],
+            reproduction_scripts=[],
+            group_urls={},
+        )
+
+        workflow_info = captured["workflow_info"]
+        assert workflow_info["report_label"] == "Ablation Report Directory"
+        assert workflow_info["report_json_path"].endswith("reports/ablation_test_sweep")
+        assert "eval_test_sweep" not in workflow_info["report_json_path"]
+        assert workflow_info["report_csv_path"] == "N/A"
+        send_mock.assert_called_once()
+
 
 class TestSensitivityTaskList:
     """Test SensitivityTask with sensitivities list format."""
@@ -433,6 +568,167 @@ class TestSensitivityTaskList:
         # In dry-run, build_training_run_command should be called for each combo
         # 2 width combos + 2 lr combos = 4
         assert mock_command_builder.build_training_run_command.call_count == 4
+
+    def test_sensitivity_dry_run_expands_default_studies_without_side_effects(
+        self,
+        cfg_workflow: DictConfig,
+        mock_wandb_service: MagicMock,
+        mock_tmux_service: MagicMock,
+        mocker: MagicMock,
+        tmp_path: Path,
+    ):
+        """Dry-run sensitivity should expand the default 2D+1D studies fully."""
+        mocker.patch("src.tasks.shared._DRY_RUN", True)
+
+        mock_sweep = MagicMock(spec=Sweep, state="FINISHED")
+        type(mock_sweep).id = PropertyMock(return_value="test_sweep")
+        type(mock_sweep).project = PropertyMock(return_value="test-proj")
+        type(mock_sweep).name = PropertyMock(return_value="test-name")
+        mock_sweep.config = {}
+
+        mock_best_run = MagicMock(spec=Run)
+        mock_best_run.config = {"model.optimizer.lr": 0.01, "data.batch_size": 64}
+        type(mock_best_run).id = PropertyMock(return_value="best_run_abc")
+        type(mock_best_run).name = PropertyMock(return_value="best-run-name")
+
+        mock_wandb_service.get_sweep.return_value = mock_sweep
+        mock_wandb_service.find_best_run.return_value = mock_best_run
+
+        def build_command(overrides, seed, group_name, cwd=""):
+            return f"python src/train.py {' '.join(overrides)} seed={seed} logger.wandb.group={group_name}"
+
+        mock_command_builder = MagicMock(spec=CommandBuilder)
+        mock_command_builder.build_training_run_command.side_effect = build_command
+
+        report_path = tmp_path / "reports" / "sensitivity_test_sweep.json"
+        with open_dict(cfg_workflow):
+            cfg_workflow.workflow.dry_run = True
+            cfg_workflow.workflow.task_name = "sensitivity"
+            cfg_workflow.workflow.sensitivity_task.num_seeds = 3
+            cfg_workflow.workflow.sensitivity_task.seed_start = 42
+            cfg_workflow.workflow.sensitivity_task.report_path = str(report_path)
+            cfg_workflow.workflow.sensitivity_task.sensitivities = [
+                {
+                    "name": "width_sensitivity",
+                    "param_grid": {
+                        "model.net.lin1_size": [32, 64, 128],
+                        "model.net.lin2_size": [32, 64, 128],
+                    },
+                    "axis_labels": {
+                        "model.net.lin1_size": "First Layer Size",
+                        "model.net.lin2_size": "Second Layer Size",
+                    },
+                },
+                {
+                    "name": "lr_sensitivity",
+                    "param_grid": {"model.optimizer.lr": [0.0001, 0.001, 0.01]},
+                    "axis_labels": {"model.optimizer.lr": "Learning Rate"},
+                },
+            ]
+
+        task = SensitivityTask(
+            cfg_workflow, mock_wandb_service, mock_tmux_service, mock_command_builder
+        )
+        mocker.patch.object(
+            type(task),
+            "ensure_evaluate_results",
+            return_value={
+                "evaluation_summary": {
+                    "top-1": {
+                        "metrics": {
+                            "test/acc": {"mean": 0.95, "std": 0.01},
+                            "test/loss": {"mean": 0.15, "std": 0.02},
+                        }
+                    }
+                }
+            },
+        )
+
+        task.run(sweep_id="test_sweep")
+
+        # width_sensitivity: 3x3 combos; lr_sensitivity: 3 combos; each has 3 seeds.
+        assert mock_command_builder.build_training_run_command.call_count == 36
+        calls = mock_command_builder.build_training_run_command.call_args_list
+        groups = [call.kwargs["group_name"] for call in calls]
+        seeds = [call.kwargs["seed"] for call in calls]
+        override_sets = [call.kwargs["overrides"] for call in calls]
+
+        assert groups.count("sensitivity/test_sweep/width_sensitivity") == 27
+        assert groups.count("sensitivity/test_sweep/lr_sensitivity") == 9
+        assert sorted(set(seeds)) == [42, 43, 44]
+        assert any(
+            "model.net.lin1_size=32" in overrides and "model.net.lin2_size=32" in overrides
+            for overrides in override_sets
+        )
+        assert any(
+            "model.net.lin1_size=128" in overrides and "model.net.lin2_size=128" in overrides
+            for overrides in override_sets
+        )
+        assert any("model.optimizer.lr=0.0001" in overrides for overrides in override_sets)
+        assert any("model.optimizer.lr=0.001" in overrides for overrides in override_sets)
+        assert any("model.optimizer.lr=0.01" in overrides for overrides in override_sets)
+        assert all("data.batch_size=64" in overrides for overrides in override_sets)
+
+        mock_wandb_service.delete_runs_in_group.assert_not_called()
+        mock_tmux_service.create_workers_session.assert_not_called()
+        assert not report_path.exists()
+
+    def test_sensitivity_email_points_to_sensitivity_report_json(
+        self,
+        cfg_workflow: DictConfig,
+        mock_wandb_service: MagicMock,
+        mock_tmux_service: MagicMock,
+        mocker: MagicMock,
+        tmp_path: Path,
+    ):
+        """Sensitivity emails should link to the sensitivity report, not the eval report."""
+        with open_dict(cfg_workflow):
+            cfg_workflow.workflow.evaluate_task.report_path = str(tmp_path / "reports" / "eval_{sweep_id}.json")
+            cfg_workflow.workflow.sensitivity_task.report_path = str(tmp_path / "reports" / "sensitivity_{sweep_id}.json")
+
+        mock_sweep = MagicMock(spec=Sweep)
+        type(mock_sweep).id = PropertyMock(return_value="test_sweep")
+        type(mock_sweep).project = PropertyMock(return_value="test-proj")
+        mock_sweep.config = {"description": "debug sweep"}
+
+        mock_best_run = MagicMock(spec=Run)
+        type(mock_best_run).id = PropertyMock(return_value="best_run_abc")
+        mock_best_run.config = {}
+
+        captured = {}
+
+        def capture_email(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        mocker.patch("src.tasks.sensitivity.build_sensitivity_email", side_effect=capture_email)
+        send_mock = mocker.patch("src.tasks.sensitivity.send_email_with_mimemultipart")
+
+        task = SensitivityTask(
+            cfg_workflow, mock_wandb_service, mock_tmux_service, MagicMock(spec=CommandBuilder)
+        )
+        task.load_eval_checkpoints = MagicMock(return_value={})
+        task.collect_checkpoint_paths = MagicMock(return_value=[])
+
+        task._send_sensitivity_email(
+            sweep_id="test_sweep",
+            sweep=mock_sweep,
+            best_run=mock_best_run,
+            best_config_dict={"model.optimizer.lr": "0.01"},
+            best_params_metrics={"test/acc": {"mean": 0.95, "std": 0.01}},
+            param_grid_results=[{"param_desc": "model.optimizer.lr=0.001", "metrics": {"test/acc": {"mean": 0.94, "std": 0.02}}}],
+            image_paths=[],
+            reproduction_scripts=[],
+            group_urls={},
+        )
+
+        workflow_info = captured["workflow_info"]
+        assert workflow_info["report_label"] == "Sensitivity Report (JSON)"
+        assert workflow_info["report_json_path"].endswith("reports/sensitivity_test_sweep.json")
+        assert "eval_test_sweep" not in workflow_info["report_json_path"]
+        assert workflow_info["report_csv_path"] == "N/A"
+        assert workflow_info["log_dir"].endswith("reports")
+        send_mock.assert_called_once()
 
     def test_sensitivity_backward_compat_param_grid(
         self,

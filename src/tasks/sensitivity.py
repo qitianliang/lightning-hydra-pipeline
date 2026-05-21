@@ -48,23 +48,19 @@ class SensitivityTask(BaseTask):
     7. 保存汇总报告 → 邮件
     """
 
-    def __init__(
-        self,
-        cfg: DictConfig,
-        wandb_service: WandbService,
-        tmux_service: TmuxService,
-        command_builder: CommandBuilder,
-    ):
-        super().__init__(cfg, wandb_service, tmux_service, command_builder)
-
     def run(self, sweep_id: Optional[str] = None):
         log.info("📐 ▶️ Launching Sensitivity Task...")
+        try:
+            self._run_sensitivity(sweep_id)
+        finally:
+            self.teardown_sandboxes()
 
-        sweep_id = self._resolve_sweep_id_with_check(sweep_id)
-
+    def _run_sensitivity(self, sweep_id: Optional[str] = None):
         if is_dry_run() and (not sweep_id or sweep_id.startswith("dry-run-")):
             log.info("[DRY-RUN] Skipping sensitivity — no valid sweep_id.")
             return
+
+        sweep_id = self._resolve_sweep_id_with_check(sweep_id)
 
         # ── Step 1: 获取 sweep ─────────────────────────────────────────
         sweep = self.get_sweep(
@@ -87,6 +83,17 @@ class SensitivityTask(BaseTask):
         best_run, config_overrides, config_dict, beautified = self.get_best_run_overrides(
             sweep, self.cfg.override_task.optimized_metric, eval_rank=eval_rank
         )
+
+        # ── Step 3.5: 准备代码快照 ──────────────────────────────────────
+        snapshot_dir = ""
+        if self.sandbox_service and self.snapshot_enabled():
+            log.info(f"📦 Preparing sandbox for sensitivity (rank-{eval_rank})")
+            snapshot_dir = self.prepare_sandbox(
+                sweep_id=sweep_id,
+                task_name="sensitivity",
+                rank=eval_rank,
+            )
+            log.info(f"   → sandbox dir: {snapshot_dir}")
 
         # ── Step 4: 解析 sensitivities 列表 ────────────────────────────
         sens_cfg = self.cfg.get("sensitivity_task", {})
@@ -185,7 +192,7 @@ class SensitivityTask(BaseTask):
         # ── Step 6: 并行执行所有实验 ───────────────────────────────────
         session_name = f"{self.cfg.general.tmux_session_name}_sensitivity_{sweep_id}"
         log.info(f"🚀 Parallel sensitivity: {len(all_experiments)} experiments in session '{session_name}'")
-        self.execute_parallel_strategy(all_experiments, session_name, mode)
+        self.execute_parallel_strategy(all_experiments, session_name, mode, snapshot_dir=snapshot_dir)
         self.wait_for_session_with_timeout(session_name, timeout_secs=timeout_secs)
 
         # ── Step 7: 按 study 收集结果 ──────────────────────────────────
@@ -219,8 +226,22 @@ class SensitivityTask(BaseTask):
                 study_plots[study_name] = (None, None)
                 continue
 
-            # 从 W&B group 获取所有 runs, 按 config 中的变参分 combo
-            runs = self.wandb_service.get_runs_by_group(group_name)
+            # 从 W&B group 获取所有 runs, 按 config 中的变参分 combo。
+            # W&B Local 删除旧 group 后可能短时间返回 stale runs；这里强制刷新并等待本轮 runs 可见。
+            import time as _time
+
+            expected_runs = len(combinations) * num_seeds
+            runs = []
+            for attempt in range(6):
+                runs = self.wandb_service.get_runs_by_group(group_name, force_refresh=True)
+                if len(runs) >= expected_runs:
+                    break
+                if attempt < 5:
+                    log.warning(
+                        f"Study [{study_name}] group '{group_name}': "
+                        f"got {len(runs)}/{expected_runs} runs after refresh; retrying..."
+                    )
+                    _time.sleep(5)
             combo_metrics: dict = {}
             param_grid_results: List[dict] = []
 
@@ -696,10 +717,14 @@ class SensitivityTask(BaseTask):
         ) if best_run and base_url else "N/A"
 
         rank_suffix = f"_r{eval_rank}" if eval_rank > 1 else ""
-        report_path_resolved = str(self.cfg.evaluate_task.report_path).format(sweep_id=sweep_id)
+        eval_report_path = str(self.cfg.evaluate_task.report_path).format(sweep_id=sweep_id)
+        sensitivity_report_path = Path(
+            str(self.cfg.sensitivity_task.get("report_path", "logs/final_reports/sensitivity_{sweep_id}.json"))
+            .format(sweep_id=f"{sweep_id}{rank_suffix}")
+        ).resolve()
 
         # 收集 checkpoint 路径: 优先读取 eval 保存的 JSON, 回退到扫描
-        report_dir = str(Path(report_path_resolved).parent.resolve())
+        report_dir = str(Path(eval_report_path).parent.resolve())
         eval_ckpt_map = self.load_eval_checkpoints(sweep_id, report_dir)
         rank_key = f"top-{eval_rank}"
         if eval_ckpt_map:
@@ -717,9 +742,10 @@ class SensitivityTask(BaseTask):
             "sweep_id": sweep_id,
             "sweep_description": sweep.config.get("description", "N/A"),
             "best_run_config": json_mod.dumps(best_config_dict, indent=4, ensure_ascii=False),
-            "report_json_path": str(Path(report_path_resolved).resolve()),
-            "report_csv_path": str(Path(report_path_resolved).with_suffix(".csv").resolve()),
-            "log_dir": str(Path(report_path_resolved).parent.resolve()),
+            "report_label": "Sensitivity Report (JSON)",
+            "report_json_path": str(sensitivity_report_path),
+            "report_csv_path": "N/A",
+            "log_dir": str(sensitivity_report_path.parent),
             "sweep_url": sweep_url,
             "best_run_host": best_run_metadata.get("host", "N/A"),
             "run_url": run_url,

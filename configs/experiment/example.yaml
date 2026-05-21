@@ -39,6 +39,8 @@ data:
 
 logger:
   wandb:
+    save_dir: "${paths.root_dir}"
+    save_code: true
     tags: ${tags}
     group: "mnist"
   aim:

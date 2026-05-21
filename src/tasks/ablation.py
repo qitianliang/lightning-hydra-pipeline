@@ -33,23 +33,19 @@ class AblationTask(BaseTask):
     6. 生成对比表 → 发邮件
     """
 
-    def __init__(
-        self,
-        cfg: DictConfig,
-        wandb_service: WandbService,
-        tmux_service: TmuxService,
-        command_builder: CommandBuilder,
-    ):
-        super().__init__(cfg, wandb_service, tmux_service, command_builder)
-
     def run(self, sweep_id: Optional[str] = None):
         log.info("🧪 ▶️ Launching Ablation Task...")
+        try:
+            self._run_ablation(sweep_id)
+        finally:
+            self.teardown_sandboxes()
 
-        sweep_id = self._resolve_sweep_id_with_check(sweep_id)
-
+    def _run_ablation(self, sweep_id: Optional[str] = None):
         if is_dry_run() and (not sweep_id or sweep_id.startswith("dry-run-")):
             log.info("[DRY-RUN] Skipping ablation — no valid sweep_id.")
             return
+
+        sweep_id = self._resolve_sweep_id_with_check(sweep_id)
 
         # ── Step 1: 获取 sweep ─────────────────────────────────────────
         sweep = self.get_sweep(
@@ -75,6 +71,17 @@ class AblationTask(BaseTask):
         best_run, config_overrides, config_dict, beautified = self.get_best_run_overrides(
             sweep, self.cfg.override_task.optimized_metric, eval_rank=eval_rank
         )
+
+        # ── Step 3.5: 准备代码快照 ──────────────────────────────────────
+        snapshot_dir = ""
+        if self.sandbox_service and self.snapshot_enabled():
+            log.info(f"📦 Preparing sandbox for ablation (rank-{eval_rank})")
+            snapshot_dir = self.prepare_sandbox(
+                sweep_id=sweep_id,
+                task_name="ablation",
+                rank=eval_rank,
+            )
+            log.info(f"   → sandbox dir: {snapshot_dir}")
 
         # ── Step 4: 构建消融实验组 ──────────────────────────────────────
         ablation_cfg = self.cfg.get("ablation_task", {})
@@ -120,7 +127,7 @@ class AblationTask(BaseTask):
                 f"{self.cfg.general.tmux_session_name}_ablation_{sweep_id}"
             )
             log.info(f"🚀 Parallel ablation: {len(experiments)} groups in session '{session_name}'")
-            self.execute_parallel_strategy(experiments, session_name, mode)
+            self.execute_parallel_strategy(experiments, session_name, mode, snapshot_dir=snapshot_dir)
             self.wait_for_session_with_timeout(session_name, timeout_secs=timeout_secs)
         else:
             # 串行模式: 逐个执行
@@ -130,6 +137,7 @@ class AblationTask(BaseTask):
                 eval_session_name = self.execute_strategy(
                     exp["overrides"], exp["group_name"], mode,
                     num_seeds=num_seeds, seed_start=seed_start,
+                    snapshot_dir=snapshot_dir,
                 )
                 self.wait_for_session_with_timeout(
                     eval_session_name, timeout_secs=timeout_secs,
@@ -230,7 +238,7 @@ class AblationTask(BaseTask):
                     series = pd.Series(scores)
                     abl_metrics[metric] = {
                         "mean": series.mean(),
-                        "std": series.std(),
+                        "std": series.std() if len(scores) > 1 else 0.0,
                         "values": series.tolist(),
                     }
 
@@ -351,10 +359,14 @@ class AblationTask(BaseTask):
         ) if best_run and base_url else "N/A"
 
         rank_suffix = f"_r{eval_rank}" if eval_rank > 1 else ""
-        report_path_resolved = str(self.cfg.evaluate_task.report_path).format(sweep_id=sweep_id)
+        eval_report_path = str(self.cfg.evaluate_task.report_path).format(sweep_id=sweep_id)
+        ablation_report_dir = Path(
+            str(self.cfg.ablation_task.get("report_path", "logs/final_reports/ablation_{sweep_id}"))
+            .format(sweep_id=f"{sweep_id}{rank_suffix}")
+        ).resolve()
 
         # 收集 checkpoint 路径: 优先读取 eval 保存的 JSON, 回退到扫描
-        report_dir = str(Path(report_path_resolved).parent.resolve())
+        report_dir = str(Path(eval_report_path).parent.resolve())
         eval_ckpt_map = self.load_eval_checkpoints(sweep_id, report_dir)
         rank_key = f"top-{eval_rank}"
         if eval_ckpt_map:
@@ -368,9 +380,10 @@ class AblationTask(BaseTask):
             "sweep_id": sweep_id,
             "sweep_description": sweep.config.get("description", "N/A"),
             "best_run_config": json_mod.dumps(best_config_dict, indent=4, ensure_ascii=False),
-            "report_json_path": str(Path(report_path_resolved).resolve()),
-            "report_csv_path": str(Path(report_path_resolved).with_suffix(".csv").resolve()),
-            "log_dir": str(Path(report_path_resolved).parent.resolve()),
+            "report_label": "Ablation Report Directory",
+            "report_json_path": str(ablation_report_dir),
+            "report_csv_path": "N/A",
+            "log_dir": str(ablation_report_dir),
             "sweep_url": sweep_url,
             "best_run_host": best_run_metadata.get("host", "N/A"),
             "run_url": run_url,

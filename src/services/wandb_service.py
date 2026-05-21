@@ -102,7 +102,8 @@ class WandbService:
             try:
                 r.load(force=True)  # refresh summary/metrics from server
             except Exception as e:
-                log.warning(f"Failed to load run {r.id}: {e}")
+                log.warning(f"Skipping stale/deleted run {r.id}: {e}")
+                continue
             result.append(r)
         return result
 

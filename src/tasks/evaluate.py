@@ -2,7 +2,6 @@
 """Stage 2: 多随机种子评估任务。"""
 
 import json
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -25,15 +24,6 @@ log = RankedLogger(__name__, rank_zero_only=True)
 class EvaluateTask(BaseTask):
     """Stage 2: 取 top_n 最优参数 → 多种子重跑 → 聚合报告。"""
 
-    def __init__(
-        self,
-        cfg: DictConfig,
-        wandb_service: WandbService,
-        tmux_service: TmuxService,
-        command_builder: CommandBuilder,
-    ):
-        super().__init__(cfg, wandb_service, tmux_service, command_builder)
-
     def run(self, sweep_id: Optional[str] = None, skip_email: bool = False):
         """执行评估任务。
 
@@ -41,6 +31,12 @@ class EvaluateTask(BaseTask):
             skip_email: True 时不发邮件 (被消融/敏感性前置调用时用)
         """
         log.info("▶️ Stage 2: Launching Evaluation Task...")
+        try:
+            self._run_eval(sweep_id, skip_email)
+        finally:
+            self.teardown_sandboxes()
+
+    def _run_eval(self, sweep_id: Optional[str] = None, skip_email: bool = False):
 
         sweep_id = self.resolve_sweep_id(sweep_id, "evaluate_task")
 
@@ -83,6 +79,17 @@ class EvaluateTask(BaseTask):
             rank_start = time.time()
             log.info(f"--- Evaluating top-{rank+1} run: {best_run.name} ---")
 
+            # 准备代码快照（替代 worktree）
+            snapshot_dir = ""
+            if self.sandbox_service and self.snapshot_enabled():
+                log.info(f"📦 Preparing code snapshot for rank-{rank+1} run: {best_run.id}")
+                snapshot_dir = self.prepare_sandbox(
+                    sweep_id=sweep_id,
+                    task_name="eval",
+                    rank=rank + 1,
+                )
+                log.info(f"   → sandbox dir: {snapshot_dir}")
+
             config_overrides = self._extract_config_overrides(best_run)
             log.info(f"📋 Extracted Sweep Overrides: {config_overrides}")
 
@@ -92,7 +99,8 @@ class EvaluateTask(BaseTask):
             log.info(f"Evaluation mode: {mode}")
 
             eval_session_name = self.execute_strategy(
-                config_overrides, group_name, mode
+                config_overrides, group_name, mode,
+                snapshot_dir=snapshot_dir,
             )
 
             if eval_session_name:
@@ -157,7 +165,7 @@ class EvaluateTask(BaseTask):
             rank_start, rank_end = rank_time_windows[rank_idx]
 
             # 获取该 group 的 runs
-            runs = self.wandb_service.get_runs_by_group(group_name)
+            runs = self.wandb_service.get_runs_by_group(group_name, force_refresh=True)
             all_final_runs.extend(runs)
 
             # Per-rank metrics
@@ -168,7 +176,7 @@ class EvaluateTask(BaseTask):
                     series = pd.Series(scores)
                     rank_metrics[metric] = {
                         "mean": series.mean(),
-                        "std": series.std(),
+                        "std": series.std() if len(scores) > 1 else 0.0,
                         "count": len(scores),
                         "values": series.tolist(),
                     }
@@ -258,6 +266,20 @@ class EvaluateTask(BaseTask):
             str(report_path.parent.resolve())
         )
 
+        # 保存 CSV (向后兼容: 所有 runs 合并)。先落盘再发邮件，确保邮件中的路径有效。
+        csv_path = report_path.with_suffix(".csv")
+        if all_final_runs:
+            data = []
+            for metric in test_metrics:
+                scores = safe_get_metric_scores(all_final_runs, metric)
+                if scores:
+                    series = pd.Series(scores)
+                    data.append([metric, series.mean(), series.std() if len(scores) > 1 else 0.0, series.tolist()])
+            if data:
+                metrics_df = pd.DataFrame(data, columns=["metric", "mean", "std", "values"])
+                metrics_df.to_csv(csv_path, index=False)
+                log.info(f"✅ Metrics data saved to {csv_path}")
+
         # ── 发送邮件 ─────────────────────────────────────────────────
         if not skip_email and rank_data:
             from src.utils.helpers import send_eval_email
@@ -271,21 +293,9 @@ class EvaluateTask(BaseTask):
                 rank_data=rank_data,
                 baseline_info=final_report.get("baseline_comparison"),
                 report_json=str(report_path.resolve()),
-                report_csv=str(report_path.with_suffix(".csv").resolve()),
+                report_csv=str(csv_path.resolve()) if csv_path.exists() else "N/A",
                 log_dir=str(report_path.parent.resolve()),
             )
-
-        # 保存 CSV (向后兼容: 所有 runs 合并)
-        if all_final_runs:
-            data = []
-            for metric in test_metrics:
-                scores = safe_get_metric_scores(all_final_runs, metric)
-                if scores:
-                    series = pd.Series(scores)
-                    data.append([metric, series.mean(), series.std(), series.tolist()])
-            if data:
-                metrics_df = pd.DataFrame(data, columns=["metric", "mean", "std", "values"])
-                metrics_df.to_csv(report_path.with_suffix(".csv"), index=False)
 
     @staticmethod
     def _extract_config_overrides(best_run: Run) -> list:

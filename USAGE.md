@@ -22,10 +22,11 @@ bash scripts/workflow.sh
 What happens:
 1. Create W&B sweep (bayesian, 4 runs max)
 2. Wait for sweep agents to finish
-3. Find best run by `val/acc_best`
-4. Retrain with 2 different seeds using best params
-5. Aggregate `test/acc` and `test/loss` → `logs/final_reports/`
-6. Send email notification (config: `notification.enabled: true`)
+3. Publish immutable source artifact `code_sweep_<sweep_id>` to W&B
+4. Find best run by `val/acc_best`
+5. Retrain with different seeds using best params in `/tmp/lightning-runs/...` sandbox
+6. Aggregate `test/acc` and `test/loss` → `logs/final_reports/`
+7. Send email notification (config: `notification.enabled: true`)
 
 **实测输出:**
 ```
@@ -46,6 +47,8 @@ Skip hyperparameter search, go straight to multi-seed evaluation.
 python src/workflow.py workflow.target_sweep_id=wxsxa50o
 # or
 bash scripts/workflow.sh pipeline wxsxa50o
+# only evaluate
+bash scripts/workflow.sh evaluate wxsxa50o
 ```
 
 Useful when:
@@ -105,8 +108,8 @@ What happens:
 1. **Check sweep exists** → not found → error, exit
 2. **Get evaluate results** → if none, run evaluate first (**no email sent**)
 3. For each component in `ablation_task.components`:
-   - Inherit best params + override component → train+evaluate (3 seeds)
-4. **Send ablation email**: full model vs each ablation variant comparison table + relative drop%
+   - Inherit best params + override component → train+evaluate (3 seeds) in sandbox when `snapshot.enabled=true`
+4. **Send ablation email**: full model vs each ablation variant comparison table + relative drop%, plus the ablation report directory
 
 Configuration (`configs/workflow/ablation.yaml`):
 ```yaml
@@ -144,13 +147,13 @@ ablation_task:
     "name": "no_lin1_bn",
     "overrides": { "model.net.lin1_size": 32 },
     "metrics": {
-        "test/acc": { "mean": 0.557, "std": NaN, "values": [0.557] },
-        "test/loss": { "mean": 1.449, "std": NaN, "values": [1.449] }
+        "test/acc": { "mean": 0.557, "std": 0.0, "values": [0.557] },
+        "test/loss": { "mean": 1.449, "std": 0.0, "values": [1.449] }
     }
 }
 ```
 
-> **💡 注意**: `std: NaN` 是因为 `num_seeds=1` 只有一个值。正式实验建议 `num_seeds >= 3`。
+> **💡 注意**: `num_seeds=1` 时报告中的 `std` 会归一为 `0.0`，避免邮件/JSON/CSV 出现 `NaN`。正式实验仍建议 `num_seeds >= 3`。
 
 ## Scenario 4: Sensitivity Mode (Standalone)
 
@@ -168,10 +171,11 @@ What happens:
 1. **Check sweep exists** → not found → error, exit
 2. **Get evaluate results** → if none, run evaluate first (**no email sent**)
 3. For each parameter combination in `sensitivity_task.param_grid`:
-   - Inherit best params + override → train+evaluate (3 seeds)
+   - Inherit best params + override → train+evaluate (3 seeds) in sandbox when `snapshot.enabled=true`
 4. **Plot**: 1D (line + error bar) or 2D (heatmap), paper-style (serif, 3.5in wide)
 5. **Save**: PNG + PDF (dpi=300) in `logs/final_reports/`
 6. **Send email**: best params metrics table + embedded plot + PDF attachment
+7. W&B Local 有最终一致性延迟时，结果收集会强制刷新并短重试，避免刚删除/重建 group 后误判无结果
 
 Configuration (`configs/workflow/sensitivity.yaml`):
 ```yaml
@@ -248,7 +252,6 @@ Connecting to SMTP server smtp.163.com:465 to send email...
 |------|----------|
 | `logs/workflow/pipeline/runs/<ts>/run.log` | Full pipeline run log |
 | `logs/sweeps/status_<sweep_id>.yaml` | Sweep metadata |
-| `logs/sweeps/...-latest.yaml` | Symlink to latest sweep |
 | `logs/final_reports/optimized_results_<sweep_id>.json` | Aggregated metrics report (per-rank) |
 | `logs/final_reports/optimized_results_<sweep_id>.csv` | Metrics table (mean, std) |
 | `logs/final_reports/eval_checkpoints_<sweep_id>.json` | Per-rank checkpoint path mapping |
@@ -345,34 +348,26 @@ bash scripts/workflow.sh dry-run
 bash scripts/workflow.sh notify
 ```
 
-### Worktree 隔离模式
+### Immutable Sandbox Isolation
 
-默认启用 worktree 隔离 — 每次实验自动在独立 git worktree 中执行：
+默认启用 `workflow.snapshot.enabled=true`。新 sweep 完成后会发布 `code_sweep_<sweep_id>` W&B artifact；`evaluate` / `ablation` / `sensitivity` 会从该 artifact 在 `/tmp/lightning-runs/<project>/sweep_<id>/...` 重建代码沙盒，并在沙盒内执行训练 payload。
 
 ```bash
-# 自动: 创建 worktree → 复制 .env/data/ → 在 worktree 中执行
-bash scripts/workflow.sh pipeline              # 新实验
-bash scripts/workflow.sh evaluate <sweep_id>   # 复用或重建 worktree
+# 正常沙盒运行
+bash scripts/workflow.sh pipeline
+bash scripts/workflow.sh evaluate <sweep_id>
 
-# 禁用 worktree (直接在主仓库执行)
-WORKTREE_ENABLED=false bash scripts/workflow.sh pipeline
+# 旧 sweep 没有 source artifact 时，可显式关闭沙盒，直接在当前工作区执行
+bash scripts/workflow.sh evaluate <sweep_id> "workflow.snapshot.enabled=false"
 
 # 超时设置 (默认 300s, 0=无限制)
 TIMEOUT_SECS=600 bash scripts/workflow.sh sensitivity <sweep_id>
 ```
 
-**Worktree 流程**:
-1. 新 sweep → snapshot 脏区 → `exp/<mode>_<timestamp>` 分支 → worktree
-2. eval/ablation/sensitivity → 查注册表 → 复用已有 worktree 或按 commit 重建
-3. 清理 → `scripts/clean/` 下自动生成**自毁**清理脚本，执行后自动删除自身
-
-```bash
-# 预览清理操作（脚本不自毁，可检查后再执行）
-bash scripts/clean/cleanup_worktree_xxx.sh --dry-run
-
-# 实际清理（执行后脚本自动销毁）
-bash scripts/clean/cleanup_worktree_xxx.sh
-```
+**Sandbox 流程**:
+1. sweep → W&B 创建 sweep → tmux agent 完成 → 发布 `code_sweep_<sweep_id>` artifact
+2. eval/ablation/sensitivity → 下载 source artifact → 解压到 `/tmp/lightning-runs/...`
+3. 沙盒软链接 `.env`、`data/` 等运行资源，任务结束后自动清理
 
 ### All Modes
 
@@ -588,3 +583,22 @@ TIMEOUT_SECS=0 bash scripts/workflow.sh sensitivity <SWEEP_ID> \
 > - 替换 `<SWEEP_ID>` 为实际 sweep ID (如 `en1zkicr`)
 > - checkpoint 只保留 epoch_*.ckpt (early stopping), 排除 last.ckpt
 > - eval checkpoint 映射自动保存到 `logs/final_reports/eval_checkpoints_<sweep_id>.json`
+
+## Real Debug Notes (2026-05-21)
+
+真实运行已覆盖 `scripts/workflow.sh` 的四种典型模式：
+
+| Mode | Result | Email |
+|------|--------|-------|
+| `sweep` | 创建 sweep、等待 tmux agent、发布 `code_sweep_<id>` artifact | 不发送邮件（设计如此） |
+| `evaluate` | top-N best run 多 seed 重跑、保存 JSON/CSV | `logs/mail/eval/` |
+| `ablation` | 展开 `no_lin1_bn` / `no_lin2_bn`，保存每组件报告 | `logs/mail/ablation/` |
+| `sensitivity` | 展开 `width_sensitivity` 2D grid 与 `lr_sensitivity` 1D grid，保存 JSON/PNG/PDF | `logs/mail/sensitivity/` |
+
+修复过的真实问题：
+
+- `workflow.snapshot.enabled=false` 现在会被任务层尊重，旧 sweep 缺少 source artifact 时可显式关闭沙盒。
+- W&B stale/deleted runs 会被跳过，避免 Eval 统计旧 run 或 Sensitivity 误判无结果。
+- Sensitivity 结果收集会 force refresh 并重试，适配 W&B Local group 删除/重建后的短暂延迟。
+- Ablation/Sensitivity 邮件分别展示真实报告目录/JSON，不再误用 Eval CSV 字段。
+- 单 seed `std` 归一为 `0.0`，邮件 markdown 不再出现孤立的 `**`。

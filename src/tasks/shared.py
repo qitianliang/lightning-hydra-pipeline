@@ -243,6 +243,7 @@ class EvaluationStrategy:
         group_name: str,
         num_seeds: Optional[int] = None,
         seed_start: Optional[int] = None,
+        snapshot_dir: str = "",
     ):
         self.wandb_service = wandb_service
         self.tmux_service = tmux_service
@@ -251,6 +252,7 @@ class EvaluationStrategy:
         self.group_name = group_name
         self.num_seeds = num_seeds
         self.seed_start = seed_start
+        self.snapshot_dir = snapshot_dir
 
     def execute(self, config_overrides: list) -> str | None:
         raise NotImplementedError
@@ -278,6 +280,7 @@ class RerunStrategy(EvaluationStrategy):
                 overrides=config_overrides,
                 seed=seed_start + i,
                 group_name=self.group_name,
+                cwd=self.snapshot_dir,
             )
             for i in range(num_seeds)
         ]

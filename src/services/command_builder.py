@@ -154,12 +154,16 @@ exit
 """
         return worker_script
 
-    def build_training_run_command(self, overrides: list, seed: int, group_name: str) -> str:
-        """為單次的多種子評估實驗構建訓練指令。"""
-        # 複製基礎指令列表以避免修改原始配置
+    def build_training_run_command(
+        self, overrides: list, seed: int, group_name: str, cwd: str = ""
+    ) -> str:
+        """為單次的多種子評估實驗構建訓練指令。
+
+        Args:
+            cwd: 可選工作目錄（姊妹目錄）。設置時命令前會插入 `cd {cwd} &&`。
+        """
         base_args = list(self.cfg.evaluate_task.run_command.base_args)
 
-        # 在已有的 'python' 後面插入 '-u' 開啟無緩衝日誌輸出
         if base_args and base_args[0] == "python":
             base_args.insert(1, "-u")
 
@@ -167,9 +171,12 @@ exit
             base_args + overrides + [f"seed={seed}", f"logger.wandb.group={group_name}"]
         )
 
-        # 直接拼接成最終的 python 指令
-        # Note: W&B credentials are exported by the calling wrapper script/environment,
-        # not inlined here, to avoid leaking secrets via /proc/PID/cmdline.
         final_command = " ".join(train_cmd_parts)
-        log.info(f"{self.conda_env=}")
-        return f"conda run {self.cmd} {self.conda_env} --no-capture-output {final_command}"
+        conda_prefix = f"conda run {self.cmd} {self.conda_env} --no-capture-output"
+        full = f"{conda_prefix} {final_command}"
+
+        if cwd:
+            full = f"cd '{cwd}' && {full}"
+
+        log.info(f"{self.conda_env=}, cwd={cwd or '<current>'}")
+        return full

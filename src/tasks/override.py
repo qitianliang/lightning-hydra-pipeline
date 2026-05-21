@@ -22,18 +22,15 @@ log = RankedLogger(__name__, rank_zero_only=True)
 class OverrideTask(BaseTask):
     """Stage 3/4: 继承最优参数 + 强制覆盖 → 多种子评估。"""
 
-    def __init__(
-        self,
-        cfg: DictConfig,
-        wandb_service: WandbService,
-        tmux_service: TmuxService,
-        command_builder: CommandBuilder,
-    ):
-        super().__init__(cfg, wandb_service, tmux_service, command_builder)
-
     def run(self, sweep_id: Optional[str] = None):
         """执行消融/覆盖任务。"""
         log.info(f"▶️ Stage: Launching Override Task [{self.cfg.override_task.name}]...")
+        try:
+            self._run_override(sweep_id)
+        finally:
+            self.teardown_sandboxes()
+
+    def _run_override(self, sweep_id: Optional[str] = None):
 
         sweep_id = self.resolve_sweep_id(sweep_id, "override_task")
 
@@ -60,6 +57,17 @@ class OverrideTask(BaseTask):
         )
         best_run = best_run_data  # use the one from get_best_run_overrides
         self.best_run_config = config_dict
+
+        # 准备代码快照
+        snapshot_dir = ""
+        if self.sandbox_service and self.snapshot_enabled():
+            log.info(f"📦 Preparing sandbox for override")
+            snapshot_dir = self.prepare_sandbox(
+                sweep_id=sweep_id,
+                task_name="override",
+                rank=1,
+            )
+            log.info(f"   → sandbox dir: {snapshot_dir}")
 
         log.info(f"✅ Best Run Config: {config_dict}")
         log.info(f"📋 Extracted Sweep Overrides: {config_overrides}")
@@ -98,6 +106,7 @@ class OverrideTask(BaseTask):
         eval_session_name = self.execute_strategy(
             final_overrides, group_name, mode,
             num_seeds=override_num_seeds, seed_start=override_seed_start,
+            snapshot_dir=snapshot_dir,
         )
 
         self.wait_for_session(eval_session_name, self.cfg.override_task.wait_interval_seconds)

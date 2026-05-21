@@ -3,7 +3,6 @@
 
 import itertools
 import os
-import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,38 +41,6 @@ from src.tasks.shared import (
 # =====================================================================================
 # Main Orchestrator
 # =====================================================================================
-def _verify_worktree_context() -> None:
-    """校验当前运行在正确的 worktree commit 上。
-
-    当 IN_WORKTREE=1 时，验证 git HEAD 与 worktree 期望一致。
-    不在 worktree 中时仅输出警告。
-    """
-    in_worktree = os.environ.get("IN_WORKTREE", "0") == "1"
-
-    if not in_worktree:
-        log.warning("⚠️  Not running in worktree. Direct execution is for development only.")
-        return
-
-    try:
-        current_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        current_branch = subprocess.check_output(
-            ["git", "branch", "--show-current"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        worktree_root = subprocess.check_output(
-            ["git", "rev-parse", "--show-toplevel"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        log.info(f"🌿 Worktree context verified:")
-        log.info(f"   HEAD={current_commit[:8]}  branch={current_branch or '(detached)'}")
-        log.info(f"   root={worktree_root}")
-    except subprocess.CalledProcessError:
-        log.warning("⚠️  Cannot verify git context (not a git repo?)")
-
-
 @task_wrapper
 def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """主编排: 初始化服务 → 阶段分发 → 执行流水线。"""
@@ -83,13 +50,13 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if is_dry_run():
         log.info("🏁 DRY-RUN MODE — commands printed, nothing executed.")
 
-    # ── Worktree 上下文校验 ────────────────────────────────────────────
-    _verify_worktree_context()
-
     log.info("Initializing services...")
     wandb_service = WandbService(cfg.workflow.wandb.entity, cfg.workflow.wandb.project)
     tmux_service = TmuxService()
     command_builder = CommandBuilder(cfg.workflow)
+
+    from src.services.sandbox_service import SandboxService
+    sandbox_service = SandboxService(cfg.workflow.wandb.entity, cfg.workflow.wandb.project)
 
     task_name = cfg.workflow.task_name
 
@@ -102,6 +69,18 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("▶️ Starting a new Sweep...")
         sweep_task = SweepTask(cfg, tmux_service, command_builder)
         active_sweep_id = sweep_task.run()
+        # Publish current source code to W&B
+        sandbox_service.publish_source_to_wandb(active_sweep_id)
+    elif task_name == "agent":
+        log.info(f"▶️ Starting Agent mode for Sweep ID: {active_sweep_id}")
+        if not active_sweep_id:
+            raise WorkflowError("Agent mode requires target_sweep_id.")
+        sandbox_dir = sandbox_service.setup_sandbox(active_sweep_id, task_name="agent")
+        log.info(f"🚀 Sandbox created at {sandbox_dir}. Launching wandb agent...")
+        import subprocess
+        sweep_path = f"{cfg.workflow.wandb.entity}/{cfg.workflow.wandb.project}/{active_sweep_id}"
+        subprocess.run(["wandb", "agent", sweep_path], cwd=sandbox_dir)
+        return {}, {}
     else:
         raise WorkflowError(
             f"Unknown task_name='{task_name}'. Use 'pipeline' (default) or 'sweep'."
@@ -116,12 +95,12 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     # 特殊模式: ablation / sensitivity (独立运行, 不走 pipeline_tasks)
     if task_name == "ablation":
-        ablation_task = AblationTask(cfg, wandb_service, tmux_service, command_builder)
+        ablation_task = AblationTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service)
         ablation_task.run(sweep_id=active_sweep_id)
         return {}, {}
 
     if task_name == "sensitivity":
-        sensitivity_task = SensitivityTask(cfg, wandb_service, tmux_service, command_builder)
+        sensitivity_task = SensitivityTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service)
         sensitivity_task.run(sweep_id=active_sweep_id)
         return {}, {}
 
@@ -151,13 +130,13 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info(f"\n========== 🔄 Pipeline Stage {idx+1}: [{base_name}] (type={task_type}) ==========")
 
         if task_type == "evaluate":
-            EvaluateTask(cfg, wandb_service, tmux_service, command_builder).run(sweep_id=active_sweep_id)
+            EvaluateTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)
 
         elif task_type == "override":
             overrides_dict = OmegaConf.to_container(task_cfg.get("overrides", {}), resolve=True)
             OmegaConf.update(cfg, "workflow.override_task.name", base_name, merge=True)
             OmegaConf.update(cfg, "workflow.override_task.overrides", overrides_dict, merge=False)
-            OverrideTask(cfg, wandb_service, tmux_service, command_builder).run(sweep_id=active_sweep_id)
+            OverrideTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)
 
         elif task_type == "grid":
             params_dict = OmegaConf.to_container(task_cfg.get("params", {}), resolve=True)
@@ -185,13 +164,13 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
                 OmegaConf.update(cfg, "workflow.override_task.name", combo_name, merge=True)
                 OmegaConf.update(cfg, "workflow.override_task.overrides", combo_dict, merge=False)
-                OverrideTask(cfg, wandb_service, tmux_service, command_builder).run(sweep_id=active_sweep_id)
+                OverrideTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)
 
         elif task_type == "ablation":
-            AblationTask(cfg, wandb_service, tmux_service, command_builder).run(sweep_id=active_sweep_id)
+            AblationTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)
 
         elif task_type == "sensitivity":
-            SensitivityTask(cfg, wandb_service, tmux_service, command_builder).run(sweep_id=active_sweep_id)
+            SensitivityTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)
 
         else:
             raise WorkflowError(f"Unknown task type '{task_type}' in pipeline_tasks!")

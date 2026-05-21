@@ -133,11 +133,19 @@ sensitivity_task:
   figure_width: 3.5             # 双列文献单列宽度 (inch)
   figure_dpi: 300
 
-# Worktree isolation configuration
-worktree:
+# Code snapshot configuration (replaces worktree)
+snapshot:
   enabled: true
+  git_remote: ""                   # 空字符串 = 自动从 origin remote 推断
+  sibling_base_dir: ""             # 空字符串 = 项目父目录
+  extra_files: [".env", "data/"]   # 复制到姊妹目录的运行时文件
+  # 姊妹目录命名: {project_name}_sweep_{sweep_id}_run_{run_id}_r{rank}
+
+# Worktree isolation (DEPRECATED, kept for backward compatibility)
+worktree:
+  enabled: false
   extra_files: [".env", "data/"]
-  sweep_name: "base"              # 匹配 configs/sweep/mnist_sweep.yaml 的 name
+  sweep_name: "base"
   registry_path: "scripts/worktree_registry.json"
 
 # pipeline_tasks: stages run in sequence after sweep (or when target_sweep_id is set)

@@ -61,6 +61,16 @@ code {
 """
 
 
+def _format_mean_std(vals: dict) -> str:
+    """Format metric mean/std, avoiding misleading ``± nan`` for single-run results."""
+    mean = vals.get("mean", float("nan"))
+    std = vals.get("std", None)
+    mean_str = "N/A" if pd.isna(mean) else f"{mean:.4g}"
+    if std is None or pd.isna(std):
+        return mean_str
+    return f"{mean_str} ± {std:.4g}"
+
+
 # ── 代理感知 SMTP 连接工厂 ─────────────────────────────────────────────────
 # 核心问题：Docker 容器无外网 DNS，smtplib 原生 TCP socket 直连 smtp.xxx.com 必死。
 # 解法：PySocks 劫持 socket → HTTP CONNECT 隧道 → DNS 由代理服务器完成。
@@ -260,12 +270,26 @@ def _build_workflow_html(workflow_info: dict, eval_rank: int = 1) -> str:
     best_config = html_mod.escape(str(workflow_info.get("best_run_config", "N/A")))
     report_json = workflow_info.get("report_json_path", "N/A")
     report_csv = workflow_info.get("report_csv_path", "N/A")
+    report_label = workflow_info.get("report_label", "Report (JSON)")
     log_dir = workflow_info.get("log_dir", "N/A")
     sweep_url = workflow_info.get("sweep_url", "")
 
     sweep_url_row = ""
     if sweep_url:
-        sweep_url_row = f'<tr><th>Sweep URL</th><td><a href="{sweep_url}">{sweep_url}</a></td></tr>'
+        sweep_url_escaped = html_mod.escape(str(sweep_url), quote=True)
+        sweep_url_row = f'<tr><th>Sweep URL</th><td><a href="{sweep_url_escaped}">{sweep_url_escaped}</a></td></tr>'
+
+    report_rows = ""
+    if report_json and str(report_json) != "N/A":
+        report_rows += (
+            f'<tr><th>{html_mod.escape(str(report_label))}</th>'
+            f'<td><code>{html_mod.escape(str(report_json))}</code></td></tr>'
+        )
+    if report_csv and str(report_csv) != "N/A":
+        report_rows += (
+            f'<tr><th>Report (CSV)</th>'
+            f'<td><code>{html_mod.escape(str(report_csv))}</code></td></tr>'
+        )
 
     # Best Run 元信息
     best_run_host = workflow_info.get("best_run_host", "N/A")
@@ -294,9 +318,8 @@ def _build_workflow_html(workflow_info: dict, eval_rank: int = 1) -> str:
         <tr><th>Run Created</th><td>{best_run_created}</td></tr>
         <tr><th>Run Duration</th><td>{best_run_duration}</td></tr>
         {ckpt_rows}
-        <tr><th>Report (JSON)</th><td><code>{report_json}</code></td></tr>
-        <tr><th>Report (CSV)</th><td><code>{report_csv}</code></td></tr>
-        <tr><th>Log Directory</th><td><code>{log_dir}</code></td></tr>
+        {report_rows}
+        <tr><th>Log Directory</th><td><code>{html_mod.escape(str(log_dir))}</code></td></tr>
     </table>
     <h4>⚙️ {config_label}</h4>
     <pre style="background:#f5f5f5; padding:12px; border-radius:4px; font-size:11px; overflow-x:auto;">{best_config}</pre>
@@ -362,11 +385,11 @@ def build_ablation_email(
     # 构建对比表
     rows = []
     for metric_name, vals in full_model_metrics.items():
-        row = {"Metric": metric_name, "Full Model": f"{vals['mean']:.4g} ± {vals['std']:.4g}"}
+        row = {"Metric": metric_name, "Full Model": _format_mean_std(vals)}
         for abl in ablation_results:
             abl_val = abl["metrics"].get(metric_name, {})
             if abl_val:
-                row[abl["name"]] = f"{abl_val['mean']:.4g} ± {abl_val['std']:.4g}"
+                row[abl["name"]] = _format_mean_std(abl_val)
             else:
                 row[abl["name"]] = "N/A"
         rows.append(row)
@@ -460,7 +483,7 @@ def build_sensitivity_email(
     # 最优参数指标表
     rows = []
     for metric_name, vals in best_params_metrics.items():
-        rows.append({"Metric": metric_name, "Mean ± Std": f"{vals['mean']:.4g} ± {vals['std']:.4g}"})
+        rows.append({"Metric": metric_name, "Mean ± Std": _format_mean_std(vals)})
     best_df = pd.DataFrame(rows)
     best_html = best_df.to_html(index=False, escape=False, classes="dataframe", border=0)
 
@@ -469,7 +492,7 @@ def build_sensitivity_email(
     for res in param_grid_results:
         row = {"Params": res.get("param_desc", "N/A")}
         for m, v in res.get("metrics", {}).items():
-            row[m] = f"{v['mean']:.4g} ± {v['std']:.4g}"
+            row[m] = _format_mean_std(v)
         grid_rows.append(row)
     grid_df = pd.DataFrame(grid_rows)
     grid_html = grid_df.to_html(index=False, escape=False, classes="dataframe", border=0)
@@ -570,7 +593,7 @@ def send_email_with_mimemultipart(notification_cfg: DictConfig, msg: MIMEMultipa
 
     # 未提供 md_content → 从 HTML body 自动提取文本
     if not md_content:
-        md_content = _html_to_markdown(msg)
+        md_content = f"# {subject}\n\n{_html_to_markdown(msg)}"
 
     _send_smtp_with_fallback(notification_cfg, msg, subject, md_content, mode=mode)
 
@@ -624,9 +647,9 @@ def _html_to_markdown(msg: MIMEMultipart) -> str:
     html = re.sub(r"<code[^>]*>", " `", html)
     html = re.sub(r"</code>", "` ", html)
     html = re.sub(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', r'[\2](\1)', html)
-    html = re.sub(r"</?strong[^>]*>", "**", html)
-    html = re.sub(r"</?b[^>]*>", "**", html)
-    html = re.sub(r"</?em[^>]*>", "*", html)
+    html = re.sub(r"</?strong(?:\s[^>]*)?>", "**", html)
+    html = re.sub(r"</?b(?:\s[^>]*)?>", "**", html)
+    html = re.sub(r"</?em(?:\s[^>]*)?>", "*", html)
 
     # 清除残差标签
     html = re.sub(r"<[^>]+>", "", html)

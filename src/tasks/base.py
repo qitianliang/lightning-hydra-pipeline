@@ -11,6 +11,7 @@ from omegaconf import DictConfig, OmegaConf
 from wandb.apis.public import Run, Sweep
 
 from src.services.command_builder import CommandBuilder
+from src.services.sandbox_service import SandboxService
 from src.services.tmux_service import TmuxService
 from src.services.wandb_service import WandbService
 from src.tasks.shared import (
@@ -34,12 +35,46 @@ class BaseTask:
         wandb_service: WandbService,
         tmux_service: TmuxService,
         command_builder: CommandBuilder,
+        sandbox_service: SandboxService = None,
     ):
         self._full_cfg = cfg  # 保留完整 cfg, 供创建子任务用
         self.cfg = cfg.workflow
         self.wandb_service = wandb_service
         self.tmux_service = tmux_service
         self.command_builder = command_builder
+        self.sandbox_service = sandbox_service
+        self._active_sandboxes: List[Path] = []
+
+    # ── 代码快照准备 ────────────────────────────────────────────────────
+    def snapshot_enabled(self) -> bool:
+        """Return whether code snapshot isolation is enabled for workflow tasks."""
+        return bool(self.cfg.get("snapshot", {}).get("enabled", True))
+
+    def prepare_sandbox(
+        self,
+        sweep_id: str,
+        task_name: str,
+        rank: int = 1,
+    ) -> str:
+        """调用 sandbox_service 构建沙盒目录，返回绝对路径字符串。"""
+        if self.sandbox_service is None or not self.snapshot_enabled():
+            return ""
+        sandbox_path = self.sandbox_service.setup_sandbox(
+            sweep_id=sweep_id,
+            task_name=task_name,
+            rank=rank,
+        )
+        self._active_sandboxes.append(sandbox_path)
+        return str(sandbox_path)
+
+    def teardown_sandboxes(self, archive_logs: bool = False):
+        """销毁所有已创建沙盒。"""
+        if not self.sandbox_service:
+            return
+        for sandbox_path in self._active_sandboxes:
+            if sandbox_path.exists():
+                self.sandbox_service.teardown(sandbox_path, archive_logs=archive_logs)
+        self._active_sandboxes.clear()
 
     # ── sweep_id 解析 ───────────────────────────────────────────────────
     def resolve_sweep_id(self, sweep_id: Optional[str] = None, task_cfg_key: str = "evaluate_task") -> str:
@@ -126,18 +161,19 @@ class BaseTask:
         mode: str,
         num_seeds: Optional[int] = None,
         seed_start: Optional[int] = None,
+        snapshot_dir: str = "",
     ) -> str | None:
         """执行 rerun/resume 策略, 返回 session name 或 None。"""
         strategy = None
         if mode == "rerun":
             strategy = RerunStrategy(
                 self.wandb_service, self.tmux_service, self.command_builder,
-                self.cfg, group_name, num_seeds, seed_start,
+                self.cfg, group_name, num_seeds, seed_start, snapshot_dir,
             )
         elif mode == "resume":
             strategy = ResumeStrategy(
                 self.wandb_service, self.tmux_service, self.command_builder,
-                self.cfg, group_name, num_seeds, seed_start,
+                self.cfg, group_name, num_seeds, seed_start, snapshot_dir,
             )
         else:
             raise WorkflowError(f"Unknown evaluation mode '{mode}'.")
@@ -158,6 +194,7 @@ class BaseTask:
         experiments: List[Dict],
         session_name: str,
         mode: str = "rerun",
+        snapshot_dir: str = "",
     ) -> str | None:
         """多实验组并行执行: 收集所有 run → 按 device 槽位 round-robin → 单 tmux session。
 
@@ -187,6 +224,7 @@ class BaseTask:
                     overrides=exp["overrides"],
                     seed=seed_start + i,
                     group_name=exp["group_name"],
+                    cwd=snapshot_dir,
                 )
                 all_commands.append(cmd)
 
@@ -206,10 +244,15 @@ class BaseTask:
                     log.info(f"  [DRY-RUN] GPU {device}: {cmd}")
             return session_name
 
-        # Dry-run 时跳过 rerun 删除
+        # Dry-run 时跳过 rerun 删除；真实 rerun 按 group 去重删除，避免 sensitivity 同组多 combo 重复查询/删除。
         if not is_dry_run():
+            seen_groups = set()
             for exp in experiments:
-                self.wandb_service.delete_runs_in_group(exp["group_name"])
+                group_name = exp["group_name"]
+                if group_name in seen_groups:
+                    continue
+                self.wandb_service.delete_runs_in_group(group_name)
+                seen_groups.add(group_name)
 
         if self.tmux_service.session_exists(session_name):
             raise SessionError(f"tmux session '{session_name}' already exists.")
