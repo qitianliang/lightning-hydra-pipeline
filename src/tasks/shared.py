@@ -190,8 +190,23 @@ def build_aggregation_report(
 
 
 # ── 从 JSON report 读取已有 evaluate 结果 ──────────────────────────────────
+def _evaluate_report_has_metrics(report: dict) -> bool:
+    summary = report.get("evaluation_summary", {}) if isinstance(report, dict) else {}
+    for value in summary.values():
+        if not isinstance(value, dict):
+            continue
+        # New format: {"top-1": {"metrics": {"test/acc": ...}}}
+        metrics = value.get("metrics")
+        if isinstance(metrics, dict) and metrics:
+            return True
+        # Old format: {"test/acc": {"mean": ..., "std": ...}}
+        if "mean" in value:
+            return True
+    return False
+
+
 def load_evaluate_report(report_path: str, sweep_id: str) -> Optional[dict]:
-    """尝试读取已有的 evaluate 报告。
+    """尝试读取已有且含有效指标的 evaluate 报告。
 
     Returns:
         报告 dict 或 None
@@ -200,8 +215,10 @@ def load_evaluate_report(report_path: str, sweep_id: str) -> Optional[dict]:
     if path.exists():
         with open(path) as f:
             report = json.load(f)
-        log.info(f"✅ Found existing evaluate report: {path}")
-        return report
+        if _evaluate_report_has_metrics(report):
+            log.info(f"✅ Found existing evaluate report: {path}")
+            return report
+        log.warning(f"⚠️ Existing evaluate report has no metrics and will be ignored: {path}")
     return None
 
 

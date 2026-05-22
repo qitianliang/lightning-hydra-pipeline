@@ -53,7 +53,7 @@ class EvaluateTask(BaseTask):
 
         log.info("--- [Phase 2.2] Finding top_n best runs and extracting hyperparameters ---")
         self.description = sweep.config.get("description", "N/A")
-        self.task = f"{sweep.project} {sweep.id[:6]}"
+        self.task = f"{sweep.project} {sweep.id}"
 
         # top_n support (workflow_rules: default 2, max 3)
         top_n = self.cfg.evaluate_task.get("top_n", 2)
@@ -79,7 +79,7 @@ class EvaluateTask(BaseTask):
             rank_start = time.time()
             log.info(f"--- Evaluating top-{rank+1} run: {best_run.name} ---")
 
-            # 准备代码快照（替代 worktree）
+            # 准备代码快照沙盒
             snapshot_dir = ""
             if self.sandbox_service and self.snapshot_enabled():
                 log.info(f"📦 Preparing code snapshot for rank-{rank+1} run: {best_run.id}")
@@ -154,7 +154,6 @@ class EvaluateTask(BaseTask):
         test_metrics = self.cfg.evaluate_task.test_metrics
 
         # ── Per-rank 数据收集 ─────────────────────────────────────────
-        all_final_runs = []
         rank_data = []  # 每个排名的独立数据
         checkpoint_map = {}
 
@@ -166,7 +165,6 @@ class EvaluateTask(BaseTask):
 
             # 获取该 group 的 runs
             runs = self.wandb_service.get_runs_by_group(group_name, force_refresh=True)
-            all_final_runs.extend(runs)
 
             # Per-rank metrics
             rank_metrics = {}
@@ -195,8 +193,19 @@ class EvaluateTask(BaseTask):
 
             # Per-rank checkpoints (用时间窗口过滤: since_time ~ until_time)
             rank_ckpts = self.collect_checkpoint_paths(
-                project_log_dir, since_time=rank_start, until_time=rank_end
+                project_log_dir,
+                group_name=group_name,
+                since_time=rank_start,
+                until_time=rank_end,
             )
+            if not rank_ckpts:
+                fallback_ckpts = self.collect_checkpoint_paths(project_log_dir, group_name=group_name)
+                rank_ckpts = fallback_ckpts[-num_seeds:] if num_seeds else fallback_ckpts
+                if rank_ckpts:
+                    log.warning(
+                        f"⚠️ {rank_label}: checkpoint time-window scan was empty; "
+                        f"using latest {len(rank_ckpts)} checkpoint(s) from group '{group_name}'."
+                    )
             checkpoint_map[rank_label] = rank_ckpts
 
             # Per-rank reproduction script
@@ -223,6 +232,17 @@ class EvaluateTask(BaseTask):
             })
 
             log.info(f"📊 {rank_label}: metrics={rank_metrics}")
+
+        missing_ranks = [rd["rank_label"] for rd in rank_data if not rd["metrics"]]
+        if missing_ranks:
+            worker_log_root = Path("logs/workflow/evaluate").resolve()
+            groups = ", ".join(group for _, group in eval_group_names)
+            raise WorkflowError(
+                "No evaluation metrics collected for "
+                f"{', '.join(missing_ranks)} in sweep {sweep.id}. "
+                "Training workers likely failed. "
+                f"Check worker logs under {worker_log_root} for groups: {groups}"
+            )
 
         # ── 保存报告 JSON ─────────────────────────────────────────────
         final_report = {
@@ -266,19 +286,28 @@ class EvaluateTask(BaseTask):
             str(report_path.parent.resolve())
         )
 
-        # 保存 CSV (向后兼容: 所有 runs 合并)。先落盘再发邮件，确保邮件中的路径有效。
+        # 保存 CSV: 每个 rank 独立一组指标，避免 top-1/top-2 被混算。
         csv_path = report_path.with_suffix(".csv")
-        if all_final_runs:
-            data = []
-            for metric in test_metrics:
-                scores = safe_get_metric_scores(all_final_runs, metric)
-                if scores:
-                    series = pd.Series(scores)
-                    data.append([metric, series.mean(), series.std() if len(scores) > 1 else 0.0, series.tolist()])
-            if data:
-                metrics_df = pd.DataFrame(data, columns=["metric", "mean", "std", "values"])
-                metrics_df.to_csv(csv_path, index=False)
-                log.info(f"✅ Metrics data saved to {csv_path}")
+        csv_rows = []
+        for rd in rank_data:
+            for metric, stats in rd["metrics"].items():
+                values = stats.get("values", [])
+                csv_rows.append({
+                    "rank": rd["rank_label"],
+                    "best_run_name": rd["best_run_name"],
+                    "metric": metric,
+                    "mean": stats.get("mean"),
+                    "std": stats.get("std", 0.0),
+                    "count": stats.get("count", len(values)),
+                    "values": values,
+                })
+        if csv_rows:
+            metrics_df = pd.DataFrame(
+                csv_rows,
+                columns=["rank", "best_run_name", "metric", "mean", "std", "count", "values"],
+            )
+            metrics_df.to_csv(csv_path, index=False)
+            log.info(f"✅ Metrics data saved to {csv_path}")
 
         # ── 发送邮件 ─────────────────────────────────────────────────
         if not skip_email and rank_data:

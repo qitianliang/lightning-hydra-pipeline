@@ -21,10 +21,30 @@ class CommandBuilder:
         self.wandb_entity = self.cfg.wandb.entity
 
         self._api_key, self._base_url = self._load_wandb_credentials()
+        self.project_root = self._infer_project_root()
         self.cmd = self._init_conda_cmd()
 
     def _init_conda_cmd(self) -> str:
         return "-p" if os.sep in self.conda_env else "-n"
+
+    @staticmethod
+    def _infer_project_root() -> Path:
+        current = Path.cwd().resolve()
+        while current != current.parent:
+            if (current / ".project-root").exists():
+                return current
+            current = current.parent
+        env_root = os.getenv("PROJECT_ROOT")
+        return Path(env_root).resolve() if env_root else Path.cwd().resolve()
+
+    def _host_runtime_overrides(self) -> List[str]:
+        root = str(self.project_root)
+        return [
+            f"paths.root_dir={root}",
+            f"paths.data_dir={root}/data/",
+            f"paths.log_dir={root}/logs/",
+            f"logger.wandb.save_dir={root}",
+        ]
 
     def _load_wandb_credentials(self) -> tuple:
         """Read W&B credentials from environment. Raises if missing."""
@@ -170,6 +190,10 @@ exit
         train_cmd_parts = (
             base_args + overrides + [f"seed={seed}", f"logger.wandb.group={group_name}"]
         )
+        if cwd:
+            # Code executes from the sandbox, but runtime artifacts must stay in the
+            # host repo so reports can collect checkpoints/logs after sandbox teardown.
+            train_cmd_parts.extend(self._host_runtime_overrides())
 
         final_command = " ".join(train_cmd_parts)
         conda_prefix = f"conda run {self.cmd} {self.conda_env} --no-capture-output"

@@ -14,7 +14,7 @@ from src.services.wandb_service import WandbService
 from src.tasks.base import BaseTask
 from src.tasks.evaluate import EvaluateTask
 from src.tasks.shared import is_dry_run, safe_get_metric_scores
-from src.utils import RankedLogger, SweepError
+from src.utils import RankedLogger, SweepError, WorkflowError
 from src.utils.email_templates import build_ablation_email, send_email_with_mimemultipart
 from src.utils.helpers import build_wandb_sweep_url, build_wandb_run_url, build_wandb_group_url, format_reproduction_script, validate_config_keys
 
@@ -48,15 +48,20 @@ class AblationTask(BaseTask):
         sweep_id = self._resolve_sweep_id_with_check(sweep_id)
 
         # ── Step 1: 获取 sweep ─────────────────────────────────────────
+        ablation_cfg = self.cfg.get("ablation_task", {})
         sweep = self.get_sweep(
             sweep_id,
-            wait=self.cfg.override_task.get("wait_for_sweep_finish", True),
-            wait_interval=self.cfg.override_task.get("wait_interval_seconds", 15),
+            wait=ablation_cfg.get("wait_for_sweep_finish", True),
+            wait_interval=ablation_cfg.get("wait_interval_seconds", 15),
         )
 
         # ── Step 2: 获取 evaluate 结果 (无则运行, 不发邮件) ─────────────
         evaluate_task = EvaluateTask(
-            self._full_cfg, self.wandb_service, self.tmux_service, self.command_builder
+            self._full_cfg,
+            self.wandb_service,
+            self.tmux_service,
+            self.command_builder,
+            self.sandbox_service,
         )
         eval_report = self.ensure_evaluate_results(sweep_id, sweep, evaluate_task)
 
@@ -64,12 +69,16 @@ class AblationTask(BaseTask):
             log.warning("No evaluate report available. Using empty baseline for ablation comparison.")
 
         # ── Step 3: 获取最优参数 (支持 eval_rank) ──────────────────────
-        eval_rank = self.cfg.evaluate_task.get("eval_rank", 1)
+        eval_rank = ablation_cfg.get("eval_rank", 1)
 
         # 提取 full model metrics (按 eval_rank)
         full_model_metrics = self._extract_full_model_metrics(eval_report, eval_rank=eval_rank)
+        optimized_metric = ablation_cfg.get(
+            "optimized_metric",
+            self.cfg.evaluate_task.get("optimized_metric", "val/acc_best"),
+        )
         best_run, config_overrides, config_dict, beautified = self.get_best_run_overrides(
-            sweep, self.cfg.override_task.optimized_metric, eval_rank=eval_rank
+            sweep, optimized_metric, eval_rank=eval_rank
         )
 
         # ── Step 3.5: 准备代码快照 ──────────────────────────────────────
@@ -84,18 +93,17 @@ class AblationTask(BaseTask):
             log.info(f"   → sandbox dir: {snapshot_dir}")
 
         # ── Step 4: 构建消融实验组 ──────────────────────────────────────
-        ablation_cfg = self.cfg.get("ablation_task", {})
         components = ablation_cfg.get("components", [])
 
         if not components:
             log.warning("No ablation components defined in ablation_task.components. Nothing to do.")
             return
 
-        num_seeds = ablation_cfg.get("num_seeds", self.cfg.override_task.num_seeds)
-        seed_start = ablation_cfg.get("seed_start", self.cfg.override_task.seed_start)
+        num_seeds = ablation_cfg.get("num_seeds", self.cfg.evaluate_task.get("num_seeds", 1))
+        seed_start = ablation_cfg.get("seed_start", self.cfg.evaluate_task.get("seed_start", 42))
         timeout_secs = ablation_cfg.get("timeout_secs", 600)
         parallel = ablation_cfg.get("parallel", True)
-        mode = self.cfg.override_task.mode
+        mode = ablation_cfg.get("mode", self.cfg.evaluate_task.get("mode", "rerun"))
 
         # 为每个消融组件构建实验描述
         experiments: List[Dict] = []
@@ -141,7 +149,7 @@ class AblationTask(BaseTask):
                 )
                 self.wait_for_session_with_timeout(
                     eval_session_name, timeout_secs=timeout_secs,
-                    interval=self.cfg.override_task.get("wait_interval_seconds", 15),
+                    interval=ablation_cfg.get("wait_interval_seconds", 15),
                 )
 
         # ── Step 6: 收集消融结果 ────────────────────────────────────────
@@ -151,6 +159,13 @@ class AblationTask(BaseTask):
         ablation_results = self._collect_ablation_results(
             experiments, test_metrics, ablation_cfg, sweep_id, eval_rank=eval_rank
         )
+        if not is_dry_run() and not ablation_results:
+            worker_log_root = Path("logs/workflow/evaluate").resolve()
+            raise WorkflowError(
+                f"No ablation metrics collected for sweep {sweep_id}. "
+                "Training workers likely failed. "
+                f"Check worker logs under {worker_log_root}."
+            )
 
         # ── Step 7: 构建复现数据 + 发送消融邮件 ─────────────────────────
         reproduction_scripts, group_urls = self._build_reproduction_data(experiments, sweep_id)
@@ -242,9 +257,16 @@ class AblationTask(BaseTask):
                         "values": series.tolist(),
                     }
 
+            if not abl_metrics:
+                log.warning(
+                    f"⚠️ Ablation [{comp_name}] collected no metrics from group '{group_name}'. "
+                    "Skipping this component."
+                )
+                continue
+
             # 保存单个消融报告
             report_path_str = str(ablation_cfg.get("report_path", "logs/final_reports/ablation_{sweep_id}"))
-            rank_suffix = f"_r{eval_rank}" if eval_rank > 1 else ""
+            rank_suffix = f"_rank{eval_rank}"
             report_dir = Path(report_path_str.format(sweep_id=f"{sweep_id}{rank_suffix}"))
             report_file = report_dir / f"{comp_name}.json"
             report_file.parent.mkdir(parents=True, exist_ok=True)
@@ -295,8 +317,8 @@ class AblationTask(BaseTask):
         for exp in experiments:
             comp_name = exp["_meta"]["name"]
             group_name = exp["group_name"]
-            num_seeds = exp.get("num_seeds", self.cfg.override_task.num_seeds)
-            seed_start = exp.get("seed_start", self.cfg.override_task.seed_start)
+            num_seeds = exp.get("num_seeds", self.cfg.ablation_task.get("num_seeds", 1))
+            seed_start = exp.get("seed_start", self.cfg.ablation_task.get("seed_start", 42))
             seeds = list(range(seed_start, seed_start + num_seeds))
 
             cmd = format_reproduction_script(
@@ -345,7 +367,7 @@ class AblationTask(BaseTask):
         import json as json_mod
         import os
 
-        subject = f"🧪 Ablation | {sweep.project} {sweep_id[:6]}"
+        subject = f"🧪 Ablation | {sweep.project} {sweep_id} rank{eval_rank}"
 
         # 构建 sweep URL
         base_url = os.getenv("WANDB_BASE_URL", "")
@@ -358,7 +380,7 @@ class AblationTask(BaseTask):
             best_run.id,
         ) if best_run and base_url else "N/A"
 
-        rank_suffix = f"_r{eval_rank}" if eval_rank > 1 else ""
+        rank_suffix = f"_rank{eval_rank}"
         eval_report_path = str(self.cfg.evaluate_task.report_path).format(sweep_id=sweep_id)
         ablation_report_dir = Path(
             str(self.cfg.ablation_task.get("report_path", "logs/final_reports/ablation_{sweep_id}"))
@@ -369,12 +391,22 @@ class AblationTask(BaseTask):
         report_dir = str(Path(eval_report_path).parent.resolve())
         eval_ckpt_map = self.load_eval_checkpoints(sweep_id, report_dir)
         rank_key = f"top-{eval_rank}"
+        checkpoint_paths = []
         if eval_ckpt_map:
             checkpoint_paths = list(eval_ckpt_map.get(rank_key, []))
             log.info(f"📋 Loaded {len(checkpoint_paths)} eval checkpoints from JSON (rank_key={rank_key})")
-        else:
+
+        if not checkpoint_paths:
             project_log_dir = str(Path(self._full_cfg.paths.log_dir).resolve())
-            checkpoint_paths = self.collect_checkpoint_paths(project_log_dir)
+            group_name = f"eval/{sweep_id}/{rank_key}"
+            fallback_ckpts = self.collect_checkpoint_paths(project_log_dir, group_name=group_name)
+            num_seeds = self.cfg.evaluate_task.get("num_seeds", 0)
+            checkpoint_paths = fallback_ckpts[-num_seeds:] if num_seeds else fallback_ckpts
+            if checkpoint_paths:
+                log.warning(
+                    f"⚠️ Eval checkpoint JSON empty for {rank_key}; "
+                    f"using latest {len(checkpoint_paths)} checkpoint(s) from group '{group_name}'."
+                )
 
         workflow_info = {
             "sweep_id": sweep_id,

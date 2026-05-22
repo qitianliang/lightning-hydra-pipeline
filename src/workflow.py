@@ -1,7 +1,6 @@
 # src/workflow.py
 """工作流编排器 — 精简调度, 任务逻辑委托至 src/tasks/ 模块。"""
 
-import itertools
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,17 +21,15 @@ from src.tasks.shared import (
 )
 from src.tasks.sweep import SweepTask
 from src.tasks.evaluate import EvaluateTask
-from src.tasks.override import OverrideTask
 from src.tasks.ablation import AblationTask
 from src.tasks.sensitivity import SensitivityTask
-from src.utils import ConfigError, RankedLogger, WorkflowError, task_wrapper
+from src.utils import RankedLogger, WorkflowError, task_wrapper
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
 # 保留公共 API 供 tests 使用
 from src.tasks.shared import (
     safe_get_metric_scores as _safe_get_metric_scores,
-    build_aggregation_report as _build_aggregation_report,
     RerunStrategy,
     ResumeStrategy,
 )
@@ -56,7 +53,13 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     command_builder = CommandBuilder(cfg.workflow)
 
     from src.services.sandbox_service import SandboxService
-    sandbox_service = SandboxService(cfg.workflow.wandb.entity, cfg.workflow.wandb.project)
+    snapshot_cfg = cfg.workflow.get("snapshot", {})
+    sandbox_service = SandboxService(
+        cfg.workflow.wandb.entity,
+        cfg.workflow.wandb.project,
+        allow_source_overwrite=snapshot_cfg.get("allow_source_overwrite", False),
+        allow_legacy_config_fallbacks=snapshot_cfg.get("legacy_config_fallbacks", True),
+    )
 
     task_name = cfg.workflow.task_name
 
@@ -69,8 +72,12 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("▶️ Starting a new Sweep...")
         sweep_task = SweepTask(cfg, tmux_service, command_builder)
         active_sweep_id = sweep_task.run()
-        # Publish current source code to W&B
-        sandbox_service.publish_source_to_wandb(active_sweep_id)
+        # Publish current source code to W&B for real sweeps only. Dry-run must stay side-effect free.
+        if is_dry_run():
+            log.info(f"[DRY-RUN] Active sweep id: {active_sweep_id}")
+            log.info("[DRY-RUN] Skipping source artifact publish.")
+        else:
+            sandbox_service.publish_source_to_wandb(active_sweep_id)
     elif task_name == "agent":
         log.info(f"▶️ Starting Agent mode for Sweep ID: {active_sweep_id}")
         if not active_sweep_id:
@@ -131,40 +138,6 @@ def execute(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
         if task_type == "evaluate":
             EvaluateTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)
-
-        elif task_type == "override":
-            overrides_dict = OmegaConf.to_container(task_cfg.get("overrides", {}), resolve=True)
-            OmegaConf.update(cfg, "workflow.override_task.name", base_name, merge=True)
-            OmegaConf.update(cfg, "workflow.override_task.overrides", overrides_dict, merge=False)
-            OverrideTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)
-
-        elif task_type == "grid":
-            params_dict = OmegaConf.to_container(task_cfg.get("params", {}), resolve=True)
-            keys = list(params_dict.keys())
-            values_lists = [v if isinstance(v, list) else [v] for v in params_dict.values()]
-            combinations = list(itertools.product(*values_lists))
-
-            # Grid组合数上限检查 (从配置读取, 默认100)
-            max_grid = cfg.workflow.sweep_task.get("max_grid_combinations", 100)
-            if len(combinations) > max_grid:
-                raise ConfigError(
-                    f"Grid组合数 {len(combinations)} > {max_grid}, 拒绝执行"
-                )
-
-            log.info(f"📐 Grid Search: {len(combinations)} sub-tasks...")
-
-            for combo_idx, combo_values in enumerate(combinations):
-                combo_dict = dict(zip(keys, combo_values))
-                name_parts = [base_name]
-                for k, v in combo_dict.items():
-                    short_k = str(k).split('.')[-1]
-                    name_parts.append(f"{short_k}_{v}")
-                combo_name = "_".join(name_parts)
-                log.info(f"  -> [Grid {combo_idx+1}/{len(combinations)}] {combo_name}")
-
-                OmegaConf.update(cfg, "workflow.override_task.name", combo_name, merge=True)
-                OmegaConf.update(cfg, "workflow.override_task.overrides", combo_dict, merge=False)
-                OverrideTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)
 
         elif task_type == "ablation":
             AblationTask(cfg, wandb_service, tmux_service, command_builder, sandbox_service).run(sweep_id=active_sweep_id)

@@ -10,7 +10,7 @@ python src/workflow.py                       # Full pipeline (default)
 
 ## Scenario 1: Full Pipeline (Default)
 
-Sweep → evaluate best params → email notification.
+Sweep -> evaluate best params -> email notification.
 
 ```bash
 # All-in-one
@@ -25,7 +25,7 @@ What happens:
 3. Publish immutable source artifact `code_sweep_<sweep_id>` to W&B
 4. Find best run by `val/acc_best`
 5. Retrain with different seeds using best params in `/tmp/lightning-runs/...` sandbox
-6. Aggregate `test/acc` and `test/loss` → `logs/final_reports/`
+6. Aggregate `test/acc` and `test/loss` -> `logs/final_reports/`
 7. Send email notification (config: `notification.enabled: true`)
 
 **实测输出:**
@@ -105,10 +105,10 @@ python src/workflow.py workflow=ablation workflow.target_sweep_id=wxsxa50o
 ```
 
 What happens:
-1. **Check sweep exists** → not found → error, exit
-2. **Get evaluate results** → if none, run evaluate first (**no email sent**)
+1. **Check sweep exists** -> not found -> error, exit
+2. **Get evaluate results** -> if none, run evaluate first (**no email sent**)
 3. For each component in `ablation_task.components`:
-   - Inherit best params + override component → train+evaluate (3 seeds) in sandbox when `snapshot.enabled=true`
+   - Inherit best params + override component -> train+evaluate (3 seeds) in sandbox when `snapshot.enabled=true`
 4. **Send ablation email**: full model vs each ablation variant comparison table + relative drop%, plus the ablation report directory
 
 Configuration (`configs/workflow/ablation.yaml`):
@@ -168,10 +168,10 @@ python src/workflow.py workflow=sensitivity workflow.target_sweep_id=wxsxa50o
 ```
 
 What happens:
-1. **Check sweep exists** → not found → error, exit
-2. **Get evaluate results** → if none, run evaluate first (**no email sent**)
-3. For each parameter combination in `sensitivity_task.param_grid`:
-   - Inherit best params + override → train+evaluate (3 seeds) in sandbox when `snapshot.enabled=true`
+1. **Check sweep exists** -> not found -> error, exit
+2. **Get evaluate results** -> if none, run evaluate first (**no email sent**)
+3. For each parameter combination in `sensitivity_task.sensitivities`:
+   - Inherit best params + override -> train+evaluate (3 seeds) in sandbox when `snapshot.enabled=true`
 4. **Plot**: 1D (line + error bar) or 2D (heatmap), paper-style (serif, 3.5in wide)
 5. **Save**: PNG + PDF (dpi=300) in `logs/final_reports/`
 6. **Send email**: best params metrics table + embedded plot + PDF attachment
@@ -189,12 +189,15 @@ target_sweep_id: null
 sensitivity_task:
   primary_metric: "test/acc"
   # 1D example:
-  # param_grid:
-  #   optimizer.lr: [0.0001, 0.001, 0.01]
-  # 2D example:
-  param_grid:
-    model.net.lin1_size: [32, 64, 128]
-    model.net.lin2_size: [32, 64, 128]
+  # Preferred format: multiple named studies
+  sensitivities:
+    - name: "width_sensitivity"
+      param_grid:
+        model.net.lin1_size: [32, 64, 128]
+        model.net.lin2_size: [32, 64, 128]
+    - name: "lr_sensitivity"
+      param_grid:
+        model.optimizer.lr: [0.0001, 0.001, 0.01]
   axis_labels:
     model.net.lin1_size: "First Layer Size"
     model.net.lin2_size: "Second Layer Size"
@@ -255,11 +258,11 @@ Connecting to SMTP server smtp.163.com:465 to send email...
 | `logs/final_reports/optimized_results_<sweep_id>.json` | Aggregated metrics report (per-rank) |
 | `logs/final_reports/optimized_results_<sweep_id>.csv` | Metrics table (mean, std) |
 | `logs/final_reports/eval_checkpoints_<sweep_id>.json` | Per-rank checkpoint path mapping |
-| `logs/final_reports/ablation_<sweep_id>[_r{rank}]/<component>.json` | Ablation per-component report |
-| `logs/final_reports/sensitivity_<sweep_id>[_r{rank}].json` | Sensitivity summary report |
-| `logs/final_reports/sensitivity_<sweep_id>[_r{rank}]/*.png` | Sensitivity plots |
-| `logs/final_reports/sensitivity_<sweep_id>[_r{rank}]/*.pdf` | Sensitivity plots (300dpi) |
-| `logs/mail/{mode}/<project>_<sid>_<ts>.md` | Email markdown (mode=eval/ablation/sensitivity/override) |
+| `logs/final_reports/ablation_<sweep_id>_rank{rank}/<component>.json` | Ablation per-component report |
+| `logs/final_reports/sensitivity_<sweep_id>_rank{rank}.json` | Sensitivity summary report |
+| `logs/final_reports/sensitivity_<sweep_id>_rank{rank}/*.png` | Sensitivity plots |
+| `logs/final_reports/sensitivity_<sweep_id>_rank{rank}/*.pdf` | Sensitivity plots (300dpi) |
+| `logs/mail/{mode}/<project>_<sweep_id>[_rankN]_<ts>.md` | Email markdown (mode=eval/ablation/sensitivity) |
 | `logs/workflow/evaluate/<session>/gpu_0.log` | Per-GPU evaluation training log |
 | `logs/workflow/.pipeline_progress_<sweep_id>` | Resume checkpoint |
 
@@ -273,7 +276,7 @@ evaluate_task:
 ```
 
 Controls max wall-clock time for multi-seed evaluation. When exceeded:
-1. tmux session receives Ctrl+C (SIGINT) → wandb flushes → run marked `failed`
+1. tmux session receives Ctrl+C (SIGINT) -> wandb flushes -> run marked `failed`
 2. tmux `kill-session` force cleanup
 3. Workflow proceeds to aggregation with whatever runs completed
 
@@ -287,7 +290,7 @@ sweep_task:
   max_grid_combinations: 100  # default
 ```
 
-Controls max Cartesian product size for `type: grid` tasks.
+Controls max Cartesian product size for sensitivity studies.
 Previously hardcoded at 100. Overridable via CLI:
 ```bash
 python src/workflow.py workflow.sweep_task.max_grid_combinations=200
@@ -365,9 +368,17 @@ TIMEOUT_SECS=600 bash scripts/workflow.sh sensitivity <sweep_id>
 ```
 
 **Sandbox 流程**:
-1. sweep → W&B 创建 sweep → tmux agent 完成 → 发布 `code_sweep_<sweep_id>` artifact
-2. eval/ablation/sensitivity → 下载 source artifact → 解压到 `/tmp/lightning-runs/...`
+1. sweep -> W&B 创建 sweep -> tmux agent 完成 -> 发布 `code_sweep_<sweep_id>` artifact
+2. eval/ablation/sensitivity -> 下载 source artifact -> 解压到 `/tmp/lightning-runs/...`
 3. 沙盒软链接 `.env`、`data/` 等运行资源，任务结束后自动清理
+4. source artifact 内含 `source_manifest.json`，记录 git commit、dirty 状态、文件 hash
+
+**版本安全**:
+- 同一个 sweep id 的 `code_sweep_<sweep_id>` 默认不可再次发布，避免 `:latest` 指到新代码。
+- 如果本机跑 sweep0 后继续开发，再用 `scripts/rsync.sh` 同步到远端跑 sweep1，两个 sweep 会各自绑定自己的 source artifact，不冲突。
+- 后续对 sweep0 做 evaluate/ablation/sensitivity 时，仍拉取 sweep0 的旧 source artifact，不用当前 rsync 后的新源码。
+- 只有明确设置 `workflow.snapshot.allow_source_overwrite=true` 才允许覆盖同名 source artifact；一般不建议。
+- `workflow.snapshot.legacy_config_fallbacks=true` 只给没有 `source_manifest.json` 的旧 artifact 补运行期配置，新 artifact 缺配置会直接报错。
 
 ### All Modes
 
@@ -541,50 +552,50 @@ OmegaConf 将路径字符串解析为 PosixPath。已在代码中统一用 `str(
 
 ## Production CLI Scripts
 
-> **正式实验配置**: `workflow=mnist_full` → `experiment=mnist_full`, `run_cap=20`, `num_seeds=5`
+> **正式实验配置**: `workflow=mnist_full` -> `experiment=mnist_full`, `run_cap=20`, `num_seeds=5`
 
 以下 4 种命令可直接复制到终端运行正式实验:
 
 ### 1. New Sweep + Evaluate (全流程)
 
 ```bash
-# 新 sweep → top-2 evaluate (5 seeds each) → email
+# 新 sweep -> top-2 evaluate (5 seeds each) -> email
 TIMEOUT_SECS=0 bash scripts/workflow.sh pipeline "" "workflow=mnist_full"
 ```
 
 ### 2. Existing Sweep + Evaluate (复用 sweep)
 
 ```bash
-# 已有 sweep_id → top-2 evaluate (5 seeds each) → email (per-rank 分段展示)
+# 已有 sweep_id -> top-2 evaluate (5 seeds each) -> email (per-rank 分段展示)
 TIMEOUT_SECS=0 bash scripts/workflow.sh pipeline <SWEEP_ID> "workflow=mnist_full"
 ```
 
 ### 3. Ablation (消融实验)
 
 ```bash
-# 已有 sweep_id → eval_rank=2 (2nd best) → 消融实验 (5 seeds) → 对比邮件
+# 已有 sweep_id -> rank-2 best params -> 消融实验 (5 seeds) -> 对比邮件
 TIMEOUT_SECS=0 bash scripts/workflow.sh ablation <SWEEP_ID> \
-  "workflow=mnist_full" "workflow.evaluate_task.eval_rank=2"
+  "workflow=mnist_full" "workflow.ablation_task.eval_rank=2"
 ```
 
 ### 4. Sensitivity (参数敏感性)
 
 ```bash
-# 已有 sweep_id → eval_rank=2 (2nd best) → 2D width + 1D lr 敏感性 (5 seeds) → 绘图 + 邮件
+# 已有 sweep_id -> rank-2 best params -> 2D width + 1D lr 敏感性 (5 seeds) -> 绘图 + 邮件
 TIMEOUT_SECS=0 bash scripts/workflow.sh sensitivity <SWEEP_ID> \
-  "workflow=mnist_full" "workflow.evaluate_task.eval_rank=2"
+  "workflow=mnist_full" "workflow.sensitivity_task.eval_rank=2"
 ```
 
 > **💡 说明**:
 > - `workflow=mnist_full` 自动切换: `experiment=mnist_full` + `run_cap=20` + `num_seeds=5`
 > - `TIMEOUT_SECS=0` 禁止超时 kill, 正式实验建议使用
 > - `num_seeds=5` 确保统计显著性 (seed=[42,43,44,45,46])
-> - `eval_rank=2` 使用第2优参数 (默认 eval_rank=1 即 best), group 加 `r2/` 前缀, 报告加 `_r2` 后缀
+> - `workflow.ablation_task.eval_rank=2` 或 `workflow.sensitivity_task.eval_rank=2` 使用第2优参数；group 加 `r2/` 前缀，报告/邮件文件名加 `_rank2` 后缀
 > - 替换 `<SWEEP_ID>` 为实际 sweep ID (如 `en1zkicr`)
 > - checkpoint 只保留 epoch_*.ckpt (early stopping), 排除 last.ckpt
 > - eval checkpoint 映射自动保存到 `logs/final_reports/eval_checkpoints_<sweep_id>.json`
 
-## Real Debug Notes (2026-05-21)
+## Real Debug Notes (2026-05-22)
 
 真实运行已覆盖 `scripts/workflow.sh` 的四种典型模式：
 

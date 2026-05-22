@@ -1,6 +1,8 @@
 # task_name controls the workflow entry mode:
-#   pipeline (default) = optional sweep → pipeline_tasks in order
+#   pipeline (default) = optional sweep -> pipeline_tasks in order
 #   sweep              = create sweep + wait, no downstream analysis
+#   ablation           = reuse target_sweep_id and run ablation_task
+#   sensitivity        = reuse target_sweep_id and run sensitivity_task
 task_name: pipeline
 
 # Set to a past sweep_id to skip hyperparameter search and reuse results.
@@ -36,28 +38,25 @@ notification:
 # Global devices config (override via CLI: workflow.devices=[0,1,2])
 devices: [0]
 
-# Sweep configuration — defines the hyperparameter search
+# Sweep configuration - defines the hyperparameter search
 sweep_task:
   conda_env: "${oc.env:PYENV}"
   config_path: "configs/sweep/mnist_sweep.yaml"
   agent_max_initial_failures: 5
-  # Grid 搜索组合数上限 (默认 100, 防误操作)
+  # Grid search combination limit, prevents accidental huge fanout.
   max_grid_combinations: 100
 
-# Evaluation configuration — retrain best params with N seeds
+# Evaluation configuration - retrain best params with N seeds
 evaluate_task:
   target_sweep_id:
   # rerun = delete old eval runs + recreate; resume = use existing
   mode: "rerun"
   optimized_metric: "val/acc_best"
-  top_n: 2                     # 取前N最优参数 (默认2, 最大3)
-  eval_rank: 1                 # ablation/sensitivity 使用第N优参数 (1=best, 2=2nd best)
+  top_n: 2
   wait_for_sweep_finish: true
   wait_interval_seconds: 15
-  # 超时: 默认 3600s (1h), 超时自动 kill tmux session
-  #       设为 0 禁用超时 (不推荐, 训练挂起会永久阻塞 workflow)
   timeout_secs: 3600
-  num_seeds: 5                 # Stage 2: 每个参数跑5个种子 (workflow_rules)
+  num_seeds: 5
   seed_start: 42
   run_command:
     base_args:
@@ -74,46 +73,35 @@ evaluate_task:
   baseline:
     enabled: false
     metric: "test/acc"
-    value: 0.95                # baseline value for improvement% calc
+    value: 0.95
 
-# Override (ablation) configuration — best params + forced overrides
-override_task:
-  name: "override_batch_size_256"
-  overrides:
-    data.batch_size: 256
+# Ablation task configuration (used by task_name=ablation or pipeline type=ablation)
+ablation_task:
+  # eval_rank belongs here: ablation selects rank-N sweep params independently.
+  eval_rank: 1
   mode: "rerun"
   optimized_metric: "val/acc_best"
   wait_for_sweep_finish: true
   wait_interval_seconds: 15
-  num_seeds: 3                 # Stage 3/4: 每个参数跑3个种子 (workflow_rules)
-  seed_start: 42
-  run_command:
-    base_args:
-      - "python"
-      - "src/train.py"
-      - "experiment=example"
-      - "trainer=gpu"
-      - "logger.wandb.project=${workflow.wandb.project}"
-  test_metrics:
-    - "test/acc"
-    - "test/loss"
-  report_path: "logs/final_reports/{group_name}.json"
-
-# Ablation task configuration (used by task_name=ablation or pipeline type=ablation)
-ablation_task:
-  timeout_secs: 600             # 超时: 10min, 超时自动 kill
-  parallel: true                # 并行模式: true=所有消融组并行
+  timeout_secs: 600
+  parallel: true
   num_seeds: 3
   seed_start: 42
   test_metrics:
     - "test/acc"
     - "test/loss"
-  report_path: "logs/final_reports/ablation_{sweep_id}.json"
-  components: []                # 在此或 workflow=ablation 中定义
+  report_path: "logs/final_reports/ablation_{sweep_id}"
+  components: []
 
 # Sensitivity task configuration (used by task_name=sensitivity or pipeline type=sensitivity)
 sensitivity_task:
-  timeout_secs: 600             # 超时: 10min, 超时自动 kill
+  # eval_rank belongs here: sensitivity selects rank-N sweep params independently.
+  eval_rank: 1
+  mode: "rerun"
+  optimized_metric: "val/acc_best"
+  wait_for_sweep_finish: true
+  wait_interval_seconds: 15
+  timeout_secs: 600
   num_seeds: 3
   seed_start: 42
   test_metrics:
@@ -121,62 +109,41 @@ sensitivity_task:
     - "test/loss"
   primary_metric: "test/acc"
   report_path: "logs/final_reports/sensitivity_{sweep_id}.json"
-  # 新格式: sensitivities 列表 (与 param_grid 互斥, 优先使用)
-  sensitivities: []             # 在此或 workflow=sensitivity 中定义
-  # 向后兼容: 单个 param_grid (sensitivities 为空时使用)
+  # New format: list of studies. Preferred over legacy param_grid.
+  sensitivities: []
+  # Legacy single-study param_grid. Used only when sensitivities is empty.
   param_grid: {}
   axis_labels:
     optimizer.lr: "Learning Rate"
     model.net.lin1_size: "First Layer Size"
     model.net.lin2_size: "Second Layer Size"
     data.batch_size: "Batch Size"
-  figure_width: 3.5             # 双列文献单列宽度 (inch)
+  figure_width: 3.5
   figure_dpi: 300
 
-# Code snapshot configuration (replaces worktree)
+# Code snapshot configuration.
+# Source code is published once per sweep id as a W&B artifact. Later evaluate/
+# ablation/sensitivity runs fetch that frozen source into /tmp sandboxes.
 snapshot:
   enabled: true
-  git_remote: ""                   # 空字符串 = 自动从 origin remote 推断
-  sibling_base_dir: ""             # 空字符串 = 项目父目录
-  extra_files: [".env", "data/"]   # 复制到姊妹目录的运行时文件
-  # 姊妹目录命名: {project_name}_sweep_{sweep_id}_run_{run_id}_r{rank}
-
-# Worktree isolation (DEPRECATED, kept for backward compatibility)
-worktree:
-  enabled: false
-  extra_files: [".env", "data/"]
-  sweep_name: "base"
-  registry_path: "scripts/worktree_registry.json"
+  # Safety: do not overwrite code_sweep_<sweep_id> by default. Reusing a sweep id
+  # after local code changes must keep using the original frozen source.
+  allow_source_overwrite: false
+  # Old code artifacts may miss newly added runtime configs; allow host fallback only
+  # for legacy artifacts with no source_manifest.json.
+  legacy_config_fallbacks: true
 
 # pipeline_tasks: stages run in sequence after sweep (or when target_sweep_id is set)
 # Supported types:
-#   evaluate    — retrain best sweep params with N seeds, aggregate metrics
-#   override    — same as evaluate but inject extra overrides (ablation)
-#   grid        — Cartesian product of multiple params (sensitivity analysis)
-#   ablation    — 消融实验模式 (自动获取 evaluate 结果, 对比汇总)
-#   sensitivity — 参数敏感性模式 (1D/2D 绘图, PDF 附件)
+#   evaluate    - retrain best sweep params with N seeds, aggregate metrics
+#   ablation    - component ablations using ablation_task
+#   sensitivity - 1D/2D sensitivity studies using sensitivity_task
 pipeline_tasks:
-  # Evaluate: retrain best sweep params with default seeds (2), aggregate metrics
   - name: "Full_Model"
     type: "evaluate"
 
-  # Ablation: override one hyperparameter to test sensitivity
-  # - name: "ablation_batch_256"
-  #   type: "override"
-  #   overrides:
-  #     data.batch_size: 256
-
-  # Grid: Cartesian product of multiple params for sensitivity analysis
-  # - name: "width_search"
-  #   type: "grid"
-  #   params:
-  #     model.net.lin1_size: [64, 128, 256]
-  #     model.net.lin2_size: [128, 256]
-
-  # Ablation mode (standalone): auto-fetches evaluate results, compares all components
   # - name: "ablation_study"
   #   type: "ablation"
 
-  # Sensitivity mode (standalone): 1D/2D grid with paper-style plots + PDF
   # - name: "sensitivity_lr"
   #   type: "sensitivity"

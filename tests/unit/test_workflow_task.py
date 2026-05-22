@@ -1,3 +1,4 @@
+import csv
 import json
 import subprocess  # nosec B404
 from pathlib import Path
@@ -12,9 +13,9 @@ from wandb.apis.public import Run, Sweep
 
 # 導入我們的生產代碼
 from src.services.command_builder import CommandBuilder
+from src.tasks.base import BaseTask
 from src.tasks.evaluate import EvaluateTask
 from src.tasks.sweep import SweepTask
-from src.tasks.override import OverrideTask
 from src.tasks.ablation import AblationTask
 from src.tasks.sensitivity import SensitivityTask
 from src.tasks.shared import is_dry_run
@@ -130,6 +131,71 @@ class TestEvaluateTask:
         assert report_data["evaluation_summary"]["top-1"]["metrics"]["test/acc"]["mean"] == pytest.approx(0.97)
         # top_n field present
         assert report_data.get("top_n") == 1
+
+
+    def test_evaluate_csv_keeps_top_ranks_separate(
+        self,
+        cfg_workflow: DictConfig,
+        mock_wandb_service: MagicMock,
+        mock_tmux_service: MagicMock,
+        tmp_path: Path,
+    ):
+        """CSV should not merge top-1 and top-2 metric values into one aggregate."""
+        with open_dict(cfg_workflow):
+            cfg_workflow.workflow.evaluate_task.report_path = str(
+                tmp_path / "reports" / "optimized_results_{sweep_id}.json"
+            )
+            cfg_workflow.workflow.evaluate_task.test_metrics = ["test/acc"]
+
+        mock_sweep = MagicMock(spec=Sweep)
+        type(mock_sweep).id = PropertyMock(return_value="test_sweep")
+        type(mock_sweep).project = PropertyMock(return_value="test-proj")
+        mock_sweep.config = {"description": "debug sweep"}
+
+        best_run_1 = MagicMock(spec=Run)
+        type(best_run_1).id = PropertyMock(return_value="best_1")
+        type(best_run_1).name = PropertyMock(return_value="best-one")
+        best_run_1.config = {"model.optimizer.lr": 0.01}
+
+        best_run_2 = MagicMock(spec=Run)
+        type(best_run_2).id = PropertyMock(return_value="best_2")
+        type(best_run_2).name = PropertyMock(return_value="best-two")
+        best_run_2.config = {"model.optimizer.lr": 0.02}
+
+        group_runs = {
+            "eval/test_sweep/top-1": [
+                MagicMock(spec=Run, summary={"test/acc": 1.0}),
+                MagicMock(spec=Run, summary={"test/acc": 0.8}),
+            ],
+            "eval/test_sweep/top-2": [
+                MagicMock(spec=Run, summary={"test/acc": 0.4}),
+                MagicMock(spec=Run, summary={"test/acc": 0.2}),
+            ],
+        }
+        mock_wandb_service.get_runs_by_group.side_effect = (
+            lambda group_name, force_refresh=False: group_runs[group_name]
+        )
+
+        task = EvaluateTask(
+            cfg_workflow, mock_wandb_service, mock_tmux_service, MagicMock(spec=CommandBuilder)
+        )
+        task.collect_checkpoint_paths = MagicMock(side_effect=[["top1.ckpt"], ["top2.ckpt"]])
+        task.extract_run_metadata = MagicMock(return_value={})
+
+        task._aggregate_and_report(
+            mock_sweep,
+            [(best_run_1, "eval/test_sweep/top-1"), (best_run_2, "eval/test_sweep/top-2")],
+            [(1.0, 2.0), (2.0, 3.0)],
+            skip_email=True,
+        )
+
+        csv_path = tmp_path / "reports" / "optimized_results_test_sweep.csv"
+        rows = list(csv.DictReader(csv_path.open()))
+        by_rank = {(row["rank"], row["metric"]): row for row in rows}
+
+        assert set(by_rank) == {("top-1", "test/acc"), ("top-2", "test/acc")}
+        assert float(by_rank[("top-1", "test/acc")]["mean"]) == pytest.approx(0.9)
+        assert float(by_rank[("top-2", "test/acc")]["mean"]) == pytest.approx(0.3)
 
 
 class TestSweepTask:
@@ -296,7 +362,10 @@ class TestAblationTaskParallel:
         mock_wandb_service.get_sweep.return_value = mock_sweep
         mock_wandb_service.find_best_run.return_value = mock_best_run
         mock_wandb_service.delete_runs_in_group.return_value = 0
-        mock_wandb_service.get_runs_by_group.return_value = []
+        mock_ablation_run = MagicMock(spec=Run)
+        type(mock_ablation_run).id = PropertyMock(return_value="abl_run_1")
+        mock_ablation_run.summary = {"test/acc": 0.9, "test/loss": 0.2}
+        mock_wandb_service.get_runs_by_group.return_value = [mock_ablation_run]
 
         # Prepare evaluate report
         report_dir = tmp_path / "reports"
@@ -501,8 +570,9 @@ class TestAblationTaskParallel:
         )
 
         workflow_info = captured["workflow_info"]
+        assert captured["subject"] == "🧪 Ablation | test-proj test_sweep rank1"
         assert workflow_info["report_label"] == "Ablation Report Directory"
-        assert workflow_info["report_json_path"].endswith("reports/ablation_test_sweep")
+        assert workflow_info["report_json_path"].endswith("reports/ablation_test_sweep_rank1")
         assert "eval_test_sweep" not in workflow_info["report_json_path"]
         assert workflow_info["report_csv_path"] == "N/A"
         send_mock.assert_called_once()
@@ -707,7 +777,9 @@ class TestSensitivityTaskList:
         task = SensitivityTask(
             cfg_workflow, mock_wandb_service, mock_tmux_service, MagicMock(spec=CommandBuilder)
         )
-        task.load_eval_checkpoints = MagicMock(return_value={})
+        task.load_eval_checkpoints = MagicMock(
+            return_value={"top-1": ["rank1_seed1.ckpt"], "top-2": ["rank2_seed1.ckpt"]}
+        )
         task.collect_checkpoint_paths = MagicMock(return_value=[])
 
         task._send_sensitivity_email(
@@ -723,11 +795,13 @@ class TestSensitivityTaskList:
         )
 
         workflow_info = captured["workflow_info"]
+        assert captured["subject"] == "📐 Sensitivity | test-proj test_sweep rank1"
         assert workflow_info["report_label"] == "Sensitivity Report (JSON)"
-        assert workflow_info["report_json_path"].endswith("reports/sensitivity_test_sweep.json")
+        assert workflow_info["report_json_path"].endswith("reports/sensitivity_test_sweep_rank1.json")
         assert "eval_test_sweep" not in workflow_info["report_json_path"]
         assert workflow_info["report_csv_path"] == "N/A"
         assert workflow_info["log_dir"].endswith("reports")
+        assert workflow_info["checkpoint_paths"] == ["rank1_seed1.ckpt"]
         send_mock.assert_called_once()
 
     def test_sensitivity_backward_compat_param_grid(
@@ -803,6 +877,32 @@ class TestSensitivityTaskList:
 
 class TestBaseTaskParallelStrategy:
     """Test BaseTask.execute_parallel_strategy and wait_for_session_with_timeout."""
+
+    def test_collect_checkpoint_paths_filters_by_wandb_group(self, tmp_path: Path):
+        """Checkpoint fallback should recover only checkpoints from the requested W&B group."""
+        def make_run(run_name: str, group_name: str) -> Path:
+            run_dir = tmp_path / "logs" / "mnist-demo" / "runs" / run_name
+            ckpt_dir = run_dir / "checkpoints"
+            meta_dir = run_dir / "wandb_run" / "files"
+            ckpt_dir.mkdir(parents=True)
+            meta_dir.mkdir(parents=True)
+            ckpt = ckpt_dir / "epoch_000.ckpt"
+            ckpt.write_text("checkpoint")
+            (ckpt_dir / "last.ckpt").write_text("last")
+            (meta_dir / "wandb-metadata.json").write_text(
+                json.dumps({"args": [f"logger.wandb.group={group_name}"]})
+            )
+            return ckpt.resolve()
+
+        top1_ckpt = make_run("run-top1", "eval/sweep123/top-1")
+        make_run("run-top2", "eval/sweep123/top-2")
+
+        paths = BaseTask.collect_checkpoint_paths(
+            str(tmp_path / "logs"), group_name="eval/sweep123/top-1"
+        )
+
+        assert paths == [str(top1_ckpt)]
+
 
     def test_parallel_strategy_devices_0_0(
         self,

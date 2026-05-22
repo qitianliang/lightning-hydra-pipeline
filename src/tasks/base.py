@@ -18,7 +18,6 @@ from src.tasks.shared import (
     RerunStrategy,
     ResumeStrategy,
     is_dry_run,
-    build_aggregation_report,
     load_evaluate_report,
 )
 from src.utils import RankedLogger, SweepError, WorkflowError
@@ -81,7 +80,7 @@ class BaseTask:
         """解析 sweep_id: 参数 > 配置 > latest 软链接。
 
         Args:
-            task_cfg_key: 从哪个配置段读取 target_sweep_id (evaluate_task / override_task / ...)
+            task_cfg_key: 从哪个配置段读取 target_sweep_id (evaluate_task / ablation_task / sensitivity_task)
         """
         if sweep_id:
             log.info(f"Using active sweep ID from current workflow: {sweep_id}")
@@ -217,8 +216,8 @@ class BaseTask:
         # 展平所有实验的 commands
         all_commands = []
         for exp in experiments:
-            num_seeds = exp.get("num_seeds", self.cfg.override_task.num_seeds)
-            seed_start = exp.get("seed_start", self.cfg.override_task.seed_start)
+            num_seeds = exp.get("num_seeds", self.cfg.evaluate_task.get("num_seeds", 1))
+            seed_start = exp.get("seed_start", self.cfg.evaluate_task.get("seed_start", 42))
             for i in range(num_seeds):
                 cmd = self.command_builder.build_training_run_command(
                     overrides=exp["overrides"],
@@ -385,28 +384,42 @@ class BaseTask:
             绝对路径列表
         """
         log_path = Path(log_dir)
-        ckpt_paths = []
+        ckpt_records = []
         seen = set()
+        expected_group_arg = f"logger.wandb.group={group_name}" if group_name else ""
 
-        for ckpt in sorted(log_path.glob("**/checkpoints/*.ckpt")):
+        for ckpt in log_path.glob("**/checkpoints/*.ckpt"):
             # 只保留 early stopping checkpoint (排除 last.ckpt)
             if ckpt.name == "last.ckpt":
                 continue
-            # 过滤旧 checkpoint (rerun 模式下)
+
             try:
                 mtime = ckpt.stat().st_mtime
             except OSError:
                 continue
+
             if since_time is not None and mtime < since_time:
                 continue
             if until_time is not None and mtime >= until_time:
                 continue
+
+            if expected_group_arg:
+                metadata_path = ckpt.parent.parent / "wandb_run" / "files" / "wandb-metadata.json"
+                try:
+                    metadata = json.loads(metadata_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                args = metadata.get("args", [])
+                if expected_group_arg not in args:
+                    continue
+
             resolved = str(ckpt.resolve())
             if resolved not in seen:
-                ckpt_paths.append(resolved)
+                ckpt_records.append((mtime, resolved))
                 seen.add(resolved)
 
-        return ckpt_paths
+        ckpt_records.sort(key=lambda item: item[0])
+        return [path for _, path in ckpt_records]
 
     # ── Eval Checkpoint 持久化 ──────────────────────────────────────
     @staticmethod

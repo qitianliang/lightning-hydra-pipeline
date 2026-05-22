@@ -110,35 +110,37 @@
 
 ---
 
-## ADR-007: top_n 评估 + eval_rank
+## ADR-007: top_n 评估 + task-local eval_rank
 
-**问题**: 消融/敏感性实验需要基于第 N 优参数（而非总是 best），且 Evaluate 阶段可能需要评估多个候选。
+**问题**: Evaluate 阶段需要评估多个候选；Ablation/Sensitivity 需要各自选择第 N 优参数。早期把 `eval_rank` 放在 `evaluate_task` 下，语义错误。
 
 **决策**:
-- `evaluate_task.top_n`: Evaluate 阶段评估前 N 个最优参数（默认 2，最大 3）
-- `evaluate_task.eval_rank`: Ablation/Sensitivity 使用第 N 优参数（1=best, 2=2nd best）
-- per-rank 时间窗口隔离 checkpoint 收集
+- `evaluate_task.top_n`: Evaluate 阶段评估前 N 个参数（默认 2，最大 3）。
+- `ablation_task.eval_rank`: Ablation 使用第 N 优参数。
+- `sensitivity_task.eval_rank`: Sensitivity 使用第 N 优参数。
+- per-rank 时间窗口和 W&B group 隔离 checkpoint 收集。
 
 **后果**:
-- ✅ Evaluate 输出多 rank 报告（top-1, top-2...）
-- ✅ 消融可对比不同基线的效果
-- ✅ checkpoint 按时间窗口关联正确 rank
+- ✅ Evaluate 输出多 rank 报告（top-1, top-2...）。
+- ✅ Ablation/Sensitivity 可独立选择 rank。
+- ✅ 邮件标题、markdown 文件名、报告路径均带完整 sweep id 和 `_rankN`。
 
 **相关**: [`src/tasks/evaluate.py`](src/tasks/evaluate.py:62), [`src/tasks/ablation.py`](src/tasks/ablation.py:71), [`src/tasks/sensitivity.py`](src/tasks/sensitivity.py:83)
 
 ---
 
-## ADR-008: Grid 组合数上限
+## ADR-008: Sensitivity Grid 组合数上限
 
-**问题**: 用户配置错误导致 grid 搜索组合爆炸（如 3 个参数各 10 值 = 1000 组合）。
+**问题**: 用户配置错误导致 sensitivity 网格组合爆炸（如 3 个参数各 10 值 = 1000 组合）。
 
-**决策**: 配置化上限 `max_grid_combinations`（默认 100），workflow.py 和 SensitivityTask 均校验，超限抛出 `ConfigError`。
+**决策**: 保留配置化上限 `max_grid_combinations`（默认 100），由 `SensitivityTask` 校验。旧 `pipeline_tasks.type=grid` API 已删除。
 
 **后果**:
-- ✅ 防止误操作导致的资源浪费
-- ✅ 可 CLI 覆盖: `workflow.sweep_task.max_grid_combinations=200`
+- ✅ 防止误操作导致资源浪费。
+- ✅ 可 CLI 覆盖: `workflow.sweep_task.max_grid_combinations=200`。
+- ✅ 网格语义集中到 `sensitivity_task.sensitivities`。
 
-**相关**: [`src/workflow.py`](src/workflow.py:168), [`src/tasks/sensitivity.py`](src/tasks/sensitivity.py:133), [`configs/workflow/mnist.yaml`](configs/workflow/mnist.yaml:45)
+**相关**: [`src/tasks/sensitivity.py`](src/tasks/sensitivity.py:133), [`configs/workflow/mnist.yaml`](configs/workflow/mnist.yaml:45)
 
 ---
 
@@ -200,7 +202,7 @@
 - ✅ `snapshot.enabled=false` 可显式跳过沙盒，便于调试旧 sweep。
 - ⚠️ 旧 sweep 若没有 `code_sweep_<id>` artifact，必须关闭 snapshot 或重新跑 sweep。
 
-**相关**: [`memory-bank/sandbox_migration_plan.md`](memory-bank/sandbox_migration_plan.md)
+**相关**: [`src/services/sandbox_service.py`](src/services/sandbox_service.py:1), [`memory-bank/workflow.md`](memory-bank/workflow.md)
 
 ---
 
@@ -238,3 +240,42 @@
 - ✅ 真实邮件内容与实际报告路径一致。
 - ✅ `num_seeds=1` 的冒烟测试不会出现 `NaN`。
 - ✅ W&B Local 删除/重建延迟不会导致 Sensitivity 误判无结果。
+
+---
+
+## ADR-014: 删除 Override/Grid 旧 API
+
+**问题**: `OverrideTask` 与 `pipeline_tasks.type=grid` 已被 Ablation/Sensitivity 的新版 API 覆盖，但仍留在配置和编排器中，造成 `eval_rank` 归属混乱、文档误导、测试路径膨胀。
+
+**决策**:
+- 删除 `src/tasks/override.py`。
+- 删除 `workflow.py` 中 `type=override` / `type=grid` 分支。
+- 删除 `configs/workflow/*` 中 `override_task` 配置。
+- 统一使用 `ablation_task` 和 `sensitivity_task` 承载 `eval_rank`、`mode`、`optimized_metric`、`num_seeds`。
+
+**后果**:
+- ✅ 四种对外模式收敛为 `sweep/evaluate/ablation/sensitivity`。
+- ✅ Ablation/Sensitivity rank 配置语义清晰。
+- ✅ 老的单参数 override 可表达为一个 ablation component；老 grid 可表达为一个 sensitivity study。
+
+**相关**: [`src/workflow.py`](src/workflow.py:1), [`configs/workflow/mnist.yaml`](configs/workflow/mnist.yaml)
+
+---
+
+## ADR-015: Source Artifact 覆盖保护
+
+**问题**: `code_sweep_<sweep_id>:latest` 若被后续代码重新发布，会让旧 sweep 的 evaluate/ablation/sensitivity 拉到新源码，破坏复现。rsync 到远端后继续开发尤其容易制造这种误解。
+
+**决策**:
+- source artifact 默认只允许首次发布。
+- 已存在同名 artifact 时抛出 `WorkflowError`。
+- 只有显式设置 `workflow.snapshot.allow_source_overwrite=true` 才允许覆盖。
+- tarball 内写入 `source_manifest.json`，记录 git commit、dirty 状态、文件 hash。
+- dry-run sweep 不发布 source artifact。
+
+**后果**:
+- ✅ sweep0 和 sweep1 即使来自不同 rsync 时刻，也各自绑定自己的源码。
+- ✅ 旧 sweep 复跑不会被当前主仓库新代码污染。
+- ✅ 旧无 manifest artifact 仍可通过 `legacy_config_fallbacks` 兼容。
+
+**相关**: [`src/services/sandbox_service.py`](src/services/sandbox_service.py:1), [`USAGE.md`](USAGE.md)

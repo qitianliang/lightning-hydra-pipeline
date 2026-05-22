@@ -23,9 +23,12 @@ class TestSandboxService:
             d_path = project_root / d
             d_path.mkdir()
             (d_path / f"test_{d}.txt").write_text(f"dummy {d}")
+        logger_dir = project_root / "configs" / "logger"
+        logger_dir.mkdir()
+        (logger_dir / "wandb.yaml").write_text("# wandb logger config\n")
             
         # Create some resources to be linked
-        for res in ["data", ".env", "pyproject.toml"]:
+        for res in ["data", ".env", ".project-root", "pyproject.toml"]:
             if res == "data":
                 (project_root / res).mkdir()
             else:
@@ -47,17 +50,32 @@ class TestSandboxService:
     def test_publish_source_to_wandb(self, mock_wandb, sandbox_service):
         mock_run = MagicMock()
         mock_wandb.init.return_value = mock_run
-        
+        mock_wandb.Api.return_value.artifact.side_effect = Exception("artifact not found")
+
         artifact_path = sandbox_service.publish_source_to_wandb("test_sweep_123")
         
         # Assertions
         assert artifact_path == "test_entity/test_project/code_sweep_test_sweep_123:latest"
         mock_wandb.init.assert_called_once()
         mock_wandb.Artifact.assert_called_once()
+        artifact_kwargs = mock_wandb.Artifact.call_args.kwargs
+        assert artifact_kwargs["metadata"]["sweep_id"] == "test_sweep_123"
+        assert artifact_kwargs["metadata"]["source_hash"]
+        assert artifact_kwargs["metadata"]["file_count"] >= 3
         mock_artifact = mock_wandb.Artifact.return_value
         mock_artifact.add_file.assert_called_once()
         mock_run.log_artifact.assert_called_once_with(mock_artifact)
         mock_run.finish.assert_called_once()
+
+
+    @patch("src.services.sandbox_service.wandb")
+    def test_publish_source_refuses_existing_artifact_by_default(self, mock_wandb, sandbox_service):
+        mock_wandb.Api.return_value.artifact.return_value = MagicMock()
+
+        with pytest.raises(WorkflowError, match="already exists"):
+            sandbox_service.publish_source_to_wandb("test_sweep_123")
+
+        mock_wandb.init.assert_not_called()
 
     @patch("src.services.sandbox_service.wandb")
     def test_setup_sandbox(self, mock_wandb, sandbox_service, tmp_path):
@@ -90,8 +108,11 @@ class TestSandboxService:
         assert (sandbox_dir / "dummy.txt").exists()
         
         # Check that link_targets were symlinked
-        for res in ["data", ".env", "pyproject.toml"]:
+        for res in ["data", ".env", ".project-root", "pyproject.toml"]:
             assert (sandbox_dir / res).is_symlink()
+
+        # Old source artifacts may miss newer runtime configs; sandbox links host fallback.
+        assert (sandbox_dir / "configs" / "logger" / "wandb.yaml").is_symlink()
             
         # Check that logs and wandb directories were created
         assert (sandbox_dir / "logs").exists()

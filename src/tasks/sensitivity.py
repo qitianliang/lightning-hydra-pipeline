@@ -63,25 +63,34 @@ class SensitivityTask(BaseTask):
         sweep_id = self._resolve_sweep_id_with_check(sweep_id)
 
         # ── Step 1: 获取 sweep ─────────────────────────────────────────
+        sens_cfg = self.cfg.get("sensitivity_task", {})
         sweep = self.get_sweep(
             sweep_id,
-            wait=self.cfg.override_task.get("wait_for_sweep_finish", True),
-            wait_interval=self.cfg.override_task.get("wait_interval_seconds", 15),
+            wait=sens_cfg.get("wait_for_sweep_finish", True),
+            wait_interval=sens_cfg.get("wait_interval_seconds", 15),
         )
 
         # ── Step 2: 获取 evaluate 结果 (无则运行, 不发邮件) ─────────────
         evaluate_task = EvaluateTask(
-            self._full_cfg, self.wandb_service, self.tmux_service, self.command_builder
+            self._full_cfg,
+            self.wandb_service,
+            self.tmux_service,
+            self.command_builder,
+            self.sandbox_service,
         )
         eval_report = self.ensure_evaluate_results(sweep_id, sweep, evaluate_task)
 
         # ── Step 2.5: eval_rank (全局使用) ─────────────────────────────
-        eval_rank = self.cfg.evaluate_task.get("eval_rank", 1)
+        eval_rank = sens_cfg.get("eval_rank", 1)
         best_params_metrics = self._extract_best_params_metrics(eval_report, eval_rank=eval_rank)
 
         # ── Step 3: 获取最优参数 (支持 eval_rank) ──────────────────────
+        optimized_metric = sens_cfg.get(
+            "optimized_metric",
+            self.cfg.evaluate_task.get("optimized_metric", "val/acc_best"),
+        )
         best_run, config_overrides, config_dict, beautified = self.get_best_run_overrides(
-            sweep, self.cfg.override_task.optimized_metric, eval_rank=eval_rank
+            sweep, optimized_metric, eval_rank=eval_rank
         )
 
         # ── Step 3.5: 准备代码快照 ──────────────────────────────────────
@@ -96,7 +105,6 @@ class SensitivityTask(BaseTask):
             log.info(f"   → sandbox dir: {snapshot_dir}")
 
         # ── Step 4: 解析 sensitivities 列表 ────────────────────────────
-        sens_cfg = self.cfg.get("sensitivity_task", {})
         studies = self._parse_sensitivity_studies(sens_cfg)
 
         if not studies:
@@ -115,12 +123,12 @@ class SensitivityTask(BaseTask):
 
         test_metrics = sens_cfg.get("test_metrics", self.cfg.evaluate_task.test_metrics)
         primary_metric = sens_cfg.get("primary_metric", test_metrics[0] if test_metrics else "test/acc")
-        num_seeds = sens_cfg.get("num_seeds", self.cfg.override_task.num_seeds)
-        seed_start = sens_cfg.get("seed_start", self.cfg.override_task.seed_start)
+        num_seeds = sens_cfg.get("num_seeds", self.cfg.evaluate_task.get("num_seeds", 1))
+        seed_start = sens_cfg.get("seed_start", self.cfg.evaluate_task.get("seed_start", 42))
         timeout_secs = sens_cfg.get("timeout_secs", 600)
         figure_width = sens_cfg.get("figure_width", 3.5)
         figure_dpi = sens_cfg.get("figure_dpi", 300)
-        mode = self.cfg.override_task.mode
+        mode = sens_cfg.get("mode", self.cfg.evaluate_task.get("mode", "rerun"))
 
         # ── Step 5: 展开所有 study 的参数组合 → 实验 ──────────────────
         # 每个 study 一个 group_name
@@ -199,7 +207,7 @@ class SensitivityTask(BaseTask):
         study_results: Dict[str, dict] = {}
         study_plots: Dict[str, Tuple[Optional[Path], Optional[Path]]] = {}
 
-        rank_suffix_dir = f"_r{eval_rank}" if eval_rank > 1 else ""
+        rank_suffix_dir = f"_rank{eval_rank}"
         report_path_str = str(sens_cfg.get("report_path", "logs/final_reports/sensitivity_{sweep_id}.json"))
         output_dir = Path(report_path_str.format(sweep_id=f"{sweep_id}{rank_suffix_dir}").rsplit(".", 1)[0])
         output_dir = Path(output_dir)
@@ -330,7 +338,7 @@ class SensitivityTask(BaseTask):
         # ── Step 8: 保存汇总报告 ───────────────────────────────────────
         if not is_dry_run():
             _rp = str(sens_cfg.get("report_path", "logs/final_reports/sensitivity_{sweep_id}.json"))
-            rank_suffix = f"_r{eval_rank}" if eval_rank > 1 else ""
+            rank_suffix = f"_rank{eval_rank}"
             report_path = Path(_rp.format(sweep_id=f"{sweep_id}{rank_suffix}"))
             report_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -388,7 +396,12 @@ class SensitivityTask(BaseTask):
                     eval_rank=eval_rank,
                 )
             else:
-                log.warning("No valid sensitivity results. Skipping email.")
+                worker_log_root = Path("logs/workflow/evaluate").resolve()
+                raise WorkflowError(
+                    f"No valid sensitivity results collected for sweep {sweep_id}. "
+                    "Training workers likely failed. "
+                    f"Check worker logs under {worker_log_root}."
+                )
 
     # ── 辅助方法 ────────────────────────────────────────────────────────
 
@@ -528,7 +541,7 @@ class SensitivityTask(BaseTask):
 
         return plot_sensitivity_1d(
             param_name=param_key,
-            title=group_name,
+            title="",
             param_values=param_values,
             metric_means=means,
             metric_stds=stds,
@@ -564,7 +577,7 @@ class SensitivityTask(BaseTask):
 
         return plot_sensitivity_2d(
             param_x_name=param_keys[0],
-            title=group_name,
+            title="",
             param_y_name=param_keys[1],
             param_x_values=x_values,
             param_y_values=y_values,
@@ -618,8 +631,8 @@ class SensitivityTask(BaseTask):
 
         for study_name, exps in study_exps.items():
             group_name = exps[0]["group_name"]
-            num_seeds = exps[0].get("num_seeds", self.cfg.override_task.num_seeds)
-            seed_start = exps[0].get("seed_start", self.cfg.override_task.seed_start)
+            num_seeds = exps[0].get("num_seeds", self.cfg.sensitivity_task.get("num_seeds", 1))
+            seed_start = exps[0].get("seed_start", self.cfg.sensitivity_task.get("seed_start", 42))
             seeds = list(range(seed_start, seed_start + num_seeds))
 
             # 识别变参 key: 所有 combo_dict 的 key 的并集
@@ -703,7 +716,7 @@ class SensitivityTask(BaseTask):
         import json as json_mod
         import os
 
-        subject = f"📐 Sensitivity | {sweep.project} {sweep_id[:6]}"
+        subject = f"📐 Sensitivity | {sweep.project} {sweep_id} rank{eval_rank}"
 
         # 构建 sweep URL
         base_url = os.getenv("WANDB_BASE_URL", "")
@@ -716,7 +729,7 @@ class SensitivityTask(BaseTask):
             best_run.id,
         ) if best_run and base_url else "N/A"
 
-        rank_suffix = f"_r{eval_rank}" if eval_rank > 1 else ""
+        rank_suffix = f"_rank{eval_rank}"
         eval_report_path = str(self.cfg.evaluate_task.report_path).format(sweep_id=sweep_id)
         sensitivity_report_path = Path(
             str(self.cfg.sensitivity_task.get("report_path", "logs/final_reports/sensitivity_{sweep_id}.json"))
@@ -727,17 +740,22 @@ class SensitivityTask(BaseTask):
         report_dir = str(Path(eval_report_path).parent.resolve())
         eval_ckpt_map = self.load_eval_checkpoints(sweep_id, report_dir)
         rank_key = f"top-{eval_rank}"
+        checkpoint_paths = []
         if eval_ckpt_map:
-            checkpoint_paths = eval_ckpt_map.get(rank_key, eval_ckpt_map.get("top-1", []))
-            for key, paths in eval_ckpt_map.items():
-                if key != "top-1":
-                    for p in paths:
-                        if p not in checkpoint_paths:
-                            checkpoint_paths.append(p)
-            log.info(f"📋 Loaded {len(checkpoint_paths)} eval checkpoints from JSON")
-        else:
+            checkpoint_paths = list(eval_ckpt_map.get(rank_key, []))
+            log.info(f"📋 Loaded {len(checkpoint_paths)} eval checkpoints from JSON (rank_key={rank_key})")
+
+        if not checkpoint_paths:
             project_log_dir = str(Path(self._full_cfg.paths.log_dir).resolve())
-            checkpoint_paths = self.collect_checkpoint_paths(project_log_dir)
+            group_name = f"eval/{sweep_id}/{rank_key}"
+            fallback_ckpts = self.collect_checkpoint_paths(project_log_dir, group_name=group_name)
+            num_seeds = self.cfg.evaluate_task.get("num_seeds", 0)
+            checkpoint_paths = fallback_ckpts[-num_seeds:] if num_seeds else fallback_ckpts
+            if checkpoint_paths:
+                log.warning(
+                    f"⚠️ Eval checkpoint JSON empty for {rank_key}; "
+                    f"using latest {len(checkpoint_paths)} checkpoint(s) from group '{group_name}'."
+                )
         workflow_info = {
             "sweep_id": sweep_id,
             "sweep_description": sweep.config.get("description", "N/A"),

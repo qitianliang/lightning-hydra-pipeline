@@ -21,7 +21,6 @@ class TestBaseTaskSnapshot:
                     "mode": "rerun",
                     "run_command": {"base_args": ["python", "src/train.py"]},
                 },
-                "override_task": {"num_seeds": 2, "seed_start": 42},
                 "devices": [0],
                 "wandb": {"entity": "test", "project": "test"},
             }
@@ -57,6 +56,24 @@ class TestBaseTaskSnapshot:
         mock_services["sandbox"].setup_sandbox.assert_called_once_with(
             sweep_id="s1", task_name="eval", rank=1,
         )
+
+
+    def test_command_builder_adds_host_runtime_overrides_for_sandbox(self, cfg):
+        """Sandbox payload should write logs/checkpoints back to the host repo."""
+        cb = CommandBuilder(cfg.workflow)
+
+        cmd = cb.build_training_run_command(
+            overrides=["model.optimizer.lr=0.01"],
+            seed=42,
+            group_name="g1",
+            cwd="/tmp/sandbox",
+        )
+
+        assert cmd.startswith("cd '/tmp/sandbox' && ")
+        assert "paths.root_dir=" in cmd
+        assert "paths.data_dir=" in cmd
+        assert "paths.log_dir=" in cmd
+        assert "logger.wandb.save_dir=" in cmd
 
     def test_execute_strategy_passes_snapshot_dir(self, cfg, mock_services):
         """execute_strategy 将 snapshot_dir 传给 RerunStrategy"""
